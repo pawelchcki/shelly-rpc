@@ -1,0 +1,26 @@
+[package]
+name = "shelly-rpc"
+description = "A no_std-first client library for Shelly smart devices."
+categories = ["embedded", "no-std", "api-bindings"]
+keywords = ["shelly", "iot", "smart-home", "embedded"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde-json-core = { version = "0.6", default-features = false }
+heapless = { version = "0.9", default-features = false, features = ["serde"] }
+reqwless = { version = "0.14", default-features = false }
+embedded-nal-async = { version = "0.9", default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

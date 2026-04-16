@@ -1,0 +1,1 @@
+{"id":3, "name":null,"initial_state":"off", "auto_on":false, "auto_on_delay":60.00, "auto_off":false, "auto_off_delay":60.00,"power_limit":3360,"voltage_limit":280,"autorecover_voltage_errors":false,"current_limit":12.000,"reverse":false}

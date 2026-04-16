@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["shelly-rpc", "shellyctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+authors = ["Pawel Chojnacki"]
+repository = "https://github.com/pawelchcki/shelly-rpc"
+homepage = "https://github.com/pawelchcki/shelly-rpc"
+readme = "README.md"
+
+[workspace.dependencies]
+shelly-rpc = { path = "shelly-rpc", version = "0.1.0", default-features = false }
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "npm", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "pawelchcki/homebrew-shellyctl"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew", "npm"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+# Which actions to run on pull requests
+pr-run-mode = "upload"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = true
+# Tolerate manual patches on the generated CI (GitHub App token for the
+# Homebrew tap + OIDC trusted publishing for npm).
+allow-dirty = ["ci"]
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

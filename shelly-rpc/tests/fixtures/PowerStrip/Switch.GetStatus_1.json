@@ -1,0 +1,1 @@
+{"id":1, "source":"short_push", "output":false, "apower":0.0, "voltage":230.3, "freq":50.0, "current":0.000, "pf":0.00, "aenergy":{"total":0.000,"by_minute":[0.000,0.000,0.000],"minute_ts":1775953140}, "ret_aenergy":{"total":0.000,"by_minute":[0.000,0.000,0.000],"minute_ts":1775953140}}
