@@ -3,6 +3,7 @@
 //! Uses the `shelly-rpc` async library over a tokio-backed network stack.
 
 mod cloud;
+mod minify;
 mod nal;
 mod self_update;
 
@@ -121,13 +122,15 @@ fn main() -> ExitCode {
                 eprintln!("error: `run` requires <host> <file.js|-e 'code'>");
                 return ExitCode::from(2);
             };
-            let code = if args.get(1).map(|s| s.as_str()) == Some("-e") {
-                let Some(expr) = args.get(2) else {
+            let rest = &args[1..];
+            let (raw, rest) = take_raw_flag(rest);
+            let code = if rest.first().map(|s| s.as_str()) == Some("-e") {
+                let Some(expr) = rest.get(1) else {
                     eprintln!("error: `-e` requires a code argument");
                     return ExitCode::from(2);
                 };
                 expr.clone()
-            } else if let Some(path) = args.get(1) {
+            } else if let Some(path) = rest.first() {
                 match std::fs::read_to_string(path) {
                     Ok(c) => c,
                     Err(e) => {
@@ -139,8 +142,10 @@ fn main() -> ExitCode {
                 eprintln!("error: `run` requires <file.js> or -e 'code'");
                 return ExitCode::from(2);
             };
+            let code = if raw { code } else { minify::minify(&code) };
             run_async(run_script_ephemeral(host, &code))
         }
+        "compile" => run_compile(&args),
         "self-update" => self_update::run(),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -169,6 +174,70 @@ fn base_url(host: &str) -> String {
         host.to_string()
     } else {
         format!("http://{host}")
+    }
+}
+
+/// Pull an optional `--raw` flag off the front of a positional-arg slice.
+/// Returns `(raw, remaining_args)`.
+fn take_raw_flag(args: &[String]) -> (bool, &[String]) {
+    match args.first() {
+        Some(s) if s == "--raw" => (true, &args[1..]),
+        _ => (false, args),
+    }
+}
+
+/// `compile <input.js> [-o output.js]` — read a source file, minify it,
+/// and either write the result to `output.js` or print it to stdout.
+fn run_compile(args: &[String]) -> ExitCode {
+    let Some(input) = args.first() else {
+        eprintln!("usage: shellyctl compile <input.js> [-o output.js]");
+        return ExitCode::from(2);
+    };
+
+    let out_path: Option<&str> = match args.len() {
+        1 => None,
+        3 if args[1] == "-o" => Some(args[2].as_str()),
+        _ => {
+            eprintln!("usage: shellyctl compile <input.js> [-o output.js]");
+            return ExitCode::from(2);
+        }
+    };
+
+    let source = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading {input}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let minified = minify::minify(&source);
+    eprintln!(
+        "{}: {} -> {} bytes ({}%)",
+        input,
+        source.len(),
+        minified.len(),
+        if source.is_empty() {
+            100
+        } else {
+            minified.len() * 100 / source.len()
+        },
+    );
+
+    match out_path {
+        Some(path) => match std::fs::write(path, &minified) {
+            Ok(()) => {
+                eprintln!("Wrote {path}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error writing {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            print!("{minified}");
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -816,6 +885,7 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
             }
         },
         "upload" => {
+            let (raw, args) = take_raw_flag(args);
             let (name, file_path) = match args.len() {
                 1 => {
                     let p = &args[0];
@@ -830,17 +900,24 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                 }
                 2 => (args[0].clone(), args[1].as_str()),
                 _ => {
-                    eprintln!("usage: shellyctl script <host> upload [name] <file.js>");
+                    eprintln!("usage: shellyctl script <host> upload [--raw] [name] <file.js>");
                     return ExitCode::from(2);
                 }
             };
 
-            let code = match std::fs::read_to_string(file_path) {
+            let source = match std::fs::read_to_string(file_path) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("error reading {file_path}: {e}");
                     return ExitCode::FAILURE;
                 }
+            };
+            let code = if raw {
+                source
+            } else {
+                let minified = minify::minify(&source);
+                eprintln!("Minified {} -> {} bytes", source.len(), minified.len());
+                minified
             };
 
             let created = match device.script_create(&name, &mut buf).await {
@@ -947,12 +1024,13 @@ fn usage() -> ExitCode {
              status   <host>                     Fetch and display device status\n    \
              update   <host>                     Install available firmware update\n    \
              script   <host> list                List scripts\n    \
-             script   <host> upload [name] <js>  Create + upload a script\n    \
+             script   <host> upload [--raw] [name] <js>  Create + upload a script (minified by default)\n    \
              script   <host> start <id>          Start a script\n    \
              script   <host> stop  <id>          Stop a script\n    \
              script   <host> delete <id>         Delete a script\n    \
-             run      <host> <file.js>             Run a script ephemerally with log streaming\n    \
-             run      <host> -e 'code'            Run inline JS ephemerally\n    \
+             compile  <in.js> [-o out.js]        Minify a script (stdout if no -o)\n    \
+             run      <host> [--raw] <file.js>   Run a script ephemerally (minified by default)\n    \
+             run      <host> [--raw] -e 'code'   Run inline JS ephemerally\n    \
              logs     <host>                     Stream device debug log\n    \
              record   <host> <dir>               Record RPC responses\n    \
              call     <host> <method>            Call a raw RPC method\n    \
