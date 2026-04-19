@@ -189,7 +189,7 @@ fn take_minify_flag(args: &[String]) -> (bool, Vec<String>) {
 
 fn read_source(path: &str) -> Result<String, ExitCode> {
     std::fs::read_to_string(path).map_err(|e| {
-        eprintln!("error reading {path}: {e}");
+        eprintln!("error: reading {path}: {e}");
         ExitCode::FAILURE
     })
 }
@@ -1061,6 +1061,47 @@ fn usage() -> ExitCode {
         version = env!("CARGO_PKG_VERSION"),
     );
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod take_minify_flag_tests {
+    use super::take_minify_flag;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn accepts_flag_at_end() {
+        let args = strings(&["script.js", "--minify"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(minify);
+        assert_eq!(rest, strings(&["script.js"]));
+    }
+
+    #[test]
+    fn accepts_flag_in_middle_and_preserves_order() {
+        let args = strings(&["name", "--minify", "upload.js"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(minify);
+        assert_eq!(rest, strings(&["name", "upload.js"]));
+    }
+
+    #[test]
+    fn removes_multiple_occurrences() {
+        let args = strings(&["--minify", "script.js", "--minify"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(minify);
+        assert_eq!(rest, strings(&["script.js"]));
+    }
+
+    #[test]
+    fn returns_original_args_when_flag_missing() {
+        let args = strings(&["name", "upload.js"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(!minify);
+        assert_eq!(rest, strings(&["name", "upload.js"]));
+    }
 }
 
 #[cfg(test)]

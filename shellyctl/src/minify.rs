@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use swc_common::{sync::Lrc, FileName, Globals, Mark, SourceMap, GLOBALS};
+use swc_common::{sync::Lrc, FileName, Globals, Mark, SourceMap, Spanned, GLOBALS};
 use swc_ecma_ast::{EsVersion, Program};
 use swc_ecma_codegen::{
     text_writer::{omit_trailing_semi, JsWriter},
@@ -17,11 +17,22 @@ use swc_ecma_minifier::{
     optimize,
     option::{CompressOptions, ExtraOptions, MangleOptions, MinifyOptions, SimpleMangleCache},
 };
-use swc_ecma_parser::{parse_file_as_script, Syntax};
+use swc_ecma_parser::{error::Error as ParseError, parse_file_as_script, Syntax};
 use swc_ecma_transforms_base::{
     fixer::{fixer, paren_remover},
     resolver,
 };
+
+fn format_parse_error(cm: &SourceMap, e: &ParseError) -> String {
+    let loc = cm.lookup_char_pos(e.span().lo);
+    format!(
+        "{}:{}:{}: {}",
+        loc.file.name,
+        loc.line,
+        loc.col.0 + 1,
+        e.kind().msg()
+    )
+}
 
 #[derive(Debug)]
 pub struct MinifyError(String);
@@ -54,12 +65,12 @@ pub fn minify(source: &str, source_name: &str) -> Result<String, MinifyError> {
             None,
             &mut errors,
         )
-        .map_err(|e| MinifyError(format!("parse error: {e:?}")))?;
+        .map_err(|e| MinifyError(format!("parse error: {}", format_parse_error(&cm, &e))))?;
 
         if !errors.is_empty() {
             let joined = errors
                 .iter()
-                .map(|e| format!("{e:?}"))
+                .map(|e| format_parse_error(&cm, e))
                 .collect::<Vec<_>>()
                 .join("; ");
             return Err(MinifyError(format!("parse errors: {joined}")));
