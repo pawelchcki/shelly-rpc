@@ -39,11 +39,6 @@ install-updater = true
 # Homebrew tap + OIDC trusted publishing for npm).
 allow-dirty = ["ci"]
 
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
-
 # Aggressive size-optimized build. Trades compile time (~3-5x slower
 # than release) for binary size. Use when shipping the CLI:
 #   cargo build -p shellyctl --profile optimized-release
@@ -55,3 +50,9 @@ codegen-units = 1    # single codegen unit lets LLVM inline more aggressively
 strip = "symbols"    # drop debug + symbol tables
 panic = "abort"      # skip unwinding tables (CLI dies on panic anyway)
 incremental = false  # incremental compilation defeats codegen-units = 1
+
+# The profile cargo-dist uses for shipped artifacts (Homebrew, npm,
+# curl installer, GitHub Releases). Inherits the size tricks above so
+# every distributed binary is the small variant.
+[profile.dist]
+inherits = "optimized-release"
