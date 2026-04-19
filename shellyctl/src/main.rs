@@ -119,26 +119,27 @@ fn main() -> ExitCode {
         }
         "run" => {
             let Some(host) = args.first() else {
-                eprintln!("error: `run` requires <host> <file.js|-e 'code'>");
+                eprintln!("error: `run` requires <host> [--minify] <file.js|-e 'code'>");
                 return ExitCode::from(2);
             };
             let (do_minify, rest) = take_minify_flag(&args[1..]);
-            let code = if rest.first().map(|s| s.as_str()) == Some("-e") {
+            let (code, source_name) = if rest.first().map(|s| s.as_str()) == Some("-e") {
                 let Some(expr) = rest.get(1) else {
                     eprintln!("error: `-e` requires a code argument");
                     return ExitCode::from(2);
                 };
-                expr.clone()
+                (expr.clone(), "<-e>".to_string())
             } else if let Some(path) = rest.first() {
-                match read_source(path) {
+                let code = match read_source(path) {
                     Ok(c) => c,
                     Err(c) => return c,
-                }
+                };
+                (code, path.clone())
             } else {
                 eprintln!("error: `run` requires <file.js> or -e 'code'");
                 return ExitCode::from(2);
             };
-            let code = match maybe_minify(code, do_minify) {
+            let code = match maybe_minify(code, do_minify, &source_name) {
                 Ok(c) => c,
                 Err(c) => return c,
             };
@@ -193,11 +194,11 @@ fn read_source(path: &str) -> Result<String, ExitCode> {
     })
 }
 
-fn maybe_minify(source: String, enabled: bool) -> Result<String, ExitCode> {
+fn maybe_minify(source: String, enabled: bool, source_name: &str) -> Result<String, ExitCode> {
     if !enabled {
         return Ok(source);
     }
-    minify::minify(&source).map_err(|e| {
+    minify::minify(&source, source_name).map_err(|e| {
         eprintln!("error: minification failed: {e}");
         ExitCode::FAILURE
     })
@@ -223,7 +224,7 @@ fn run_compile(args: &[String]) -> ExitCode {
         Err(c) => return c,
     };
     let source_len = source.len();
-    let minified = match maybe_minify(source, true) {
+    let minified = match maybe_minify(source, true, input) {
         Ok(m) => m,
         Err(c) => return c,
     };
@@ -926,7 +927,7 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                 Err(c) => return c,
             };
             let source_len = source.len();
-            let code = match maybe_minify(source, do_minify) {
+            let code = match maybe_minify(source, do_minify, &file_path) {
                 Ok(c) => c,
                 Err(c) => return c,
             };

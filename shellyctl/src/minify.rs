@@ -34,11 +34,13 @@ impl std::fmt::Display for MinifyError {
 
 impl std::error::Error for MinifyError {}
 
-/// Minify a JS source string.
-pub fn minify(source: &str) -> Result<String, MinifyError> {
+/// Minify a JS source string. `source_name` is only used for diagnostic
+/// labels (parse/codegen errors reference it), so pass the real file
+/// path where available.
+pub fn minify(source: &str, source_name: &str) -> Result<String, MinifyError> {
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(
-        Lrc::new(FileName::Custom("input.js".into())),
+        Lrc::new(FileName::Custom(source_name.into())),
         source.to_string(),
     );
 
@@ -120,7 +122,7 @@ mod tests {
     use super::*;
 
     fn min(src: &str) -> String {
-        minify(src).expect("minify should succeed")
+        minify(src, "test.js").expect("minify should succeed")
     }
 
     #[test]
@@ -167,7 +169,7 @@ mod tests {
 
     #[test]
     fn returns_error_on_invalid_syntax() {
-        assert!(minify("function (").is_err());
+        assert!(minify("function (", "test.js").is_err());
     }
 
     #[test]
