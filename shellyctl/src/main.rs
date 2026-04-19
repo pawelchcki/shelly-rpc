@@ -143,7 +143,13 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             let code = if do_minify {
-                minify::minify(&code)
+                match minify::minify(&code) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("error: minification failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
             } else {
                 code
             };
@@ -214,7 +220,13 @@ fn run_compile(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let minified = minify::minify(&source);
+    let minified = match minify::minify(&source) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: minification failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!(
         "{}: {} -> {} bytes ({}%)",
         input,
@@ -917,9 +929,16 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                 }
             };
             let code = if do_minify {
-                let minified = minify::minify(&source);
-                eprintln!("Minified {} -> {} bytes", source.len(), minified.len());
-                minified
+                match minify::minify(&source) {
+                    Ok(minified) => {
+                        eprintln!("Minified {} -> {} bytes", source.len(), minified.len());
+                        minified
+                    }
+                    Err(e) => {
+                        eprintln!("error: minification failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
             } else {
                 source
             };

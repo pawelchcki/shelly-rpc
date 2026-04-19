@@ -1,263 +1,185 @@
-//! Conservative minifier for mJS (Mongoose JavaScript) source.
+//! SWC-backed minifier for mJS scripts.
 //!
-//! On-device scripts must fit in ~2KB, which rewards keeping verbose,
-//! commented source in the repo and "compiling" it down before upload.
-//! This minifier is deliberately cautious: it strips comments, trims
-//! whitespace around punctuation, and preserves string/template literals
-//! verbatim. It does not rename identifiers or rewrite expressions, so the
-//! output is still recognizable when debugging on-device.
+//! Uses `swc_ecma_minifier` for scope-aware identifier mangling and
+//! whitespace removal. Output is targeted at ES5 because the on-device
+//! Mongoose JS engine doesn't support arrow functions, template
+//! literals, classes, destructuring, etc. — features the minifier would
+//! otherwise emit when collapsing expressions.
 //!
-//! Regex literals are not detected — scripts that need a regex should
-//! keep it on its own line or inside a string. The mJS scripts this ships
-//! with don't use regex literals.
+//! Failures (parse errors, codegen errors) propagate so callers can
+//! surface them instead of silently uploading the unminified source.
+
+use std::sync::Arc;
+
+use swc_common::{sync::Lrc, FileName, Globals, Mark, SourceMap, GLOBALS};
+use swc_ecma_ast::{EsVersion, Program};
+use swc_ecma_codegen::{
+    text_writer::{omit_trailing_semi, JsWriter},
+    Config as CodegenConfig, Emitter,
+};
+use swc_ecma_minifier::{
+    optimize,
+    option::{CompressOptions, ExtraOptions, MangleOptions, MinifyOptions, SimpleMangleCache},
+};
+use swc_ecma_parser::{parse_file_as_script, Syntax};
+use swc_ecma_transforms_base::{
+    fixer::{fixer, paren_remover},
+    resolver,
+};
+
+#[derive(Debug)]
+pub struct MinifyError(String);
+
+impl std::fmt::Display for MinifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MinifyError {}
 
 /// Minify a JS source string.
-///
-/// Returns the minified source. Never fails; malformed input is passed
-/// through as faithfully as possible.
-pub fn minify(source: &str) -> String {
-    let stripped = strip_comments(source);
-    collapse_whitespace(&stripped)
-}
+pub fn minify(source: &str) -> Result<String, MinifyError> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Custom("input.js".into())),
+        source.to_string(),
+    );
 
-/// Strip `//` and `/* */` comments. Contents of string and template
-/// literals are preserved verbatim (including any `//` or `/*` inside).
-fn strip_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let mut errors = Vec::new();
+        let script = parse_file_as_script(
+            &fm,
+            Syntax::Es(Default::default()),
+            EsVersion::Es5,
+            None,
+            &mut errors,
+        )
+        .map_err(|e| MinifyError(format!("parse error: {e:?}")))?;
 
-    while i < bytes.len() {
-        let c = bytes[i];
-
-        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
+        if !errors.is_empty() {
+            let joined = errors
+                .iter()
+                .map(|e| format!("{e:?}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(MinifyError(format!("parse errors: {joined}")));
         }
 
-        if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(bytes.len());
-            // Replace the comment with a space so adjacent tokens don't glue.
-            out.push(b' ');
-            continue;
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+
+        let program = Program::Script(script)
+            .apply(resolver(unresolved_mark, top_level_mark, false))
+            .apply(paren_remover(None));
+
+        let program = optimize(
+            program,
+            cm.clone(),
+            None,
+            None,
+            &MinifyOptions {
+                compress: Some(CompressOptions {
+                    arrows: false,
+                    ecma: EsVersion::Es5,
+                    ..Default::default()
+                }),
+                mangle: Some(MangleOptions {
+                    top_level: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &ExtraOptions {
+                unresolved_mark,
+                top_level_mark,
+                mangle_name_cache: Some(Arc::new(SimpleMangleCache::default())),
+            },
+        );
+
+        let program = program.apply(fixer(None));
+
+        let mut buf = Vec::new();
+        {
+            let mut emitter = Emitter {
+                cfg: CodegenConfig::default()
+                    .with_minify(true)
+                    .with_target(EsVersion::Es5),
+                cm: cm.clone(),
+                comments: None,
+                wr: omit_trailing_semi(JsWriter::new(cm.clone(), "\n", &mut buf, None)),
+            };
+            emitter
+                .emit_program(&program)
+                .map_err(|e| MinifyError(format!("codegen error: {e}")))?;
         }
 
-        if matches!(c, b'"' | b'\'' | b'`') {
-            let quote = c;
-            out.push(c);
-            i += 1;
-            while i < bytes.len() {
-                let sc = bytes[i];
-                out.push(sc);
-                i += 1;
-                if sc == b'\\' {
-                    if i < bytes.len() {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                } else if sc == quote {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        out.push(c);
-        i += 1;
-    }
-
-    // We only ever copy whole bytes from valid UTF-8 input and never split
-    // multi-byte sequences (comment/string delimiters are all ASCII), so
-    // the result is still valid UTF-8.
-    String::from_utf8(out).expect("minifier preserves UTF-8 boundaries")
-}
-
-/// Collapse runs of whitespace. A single space is kept only when it
-/// separates two identifier-like bytes (so `return x` stays separated
-/// while `a + b` collapses to `a+b`).
-fn collapse_whitespace(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let c = bytes[i];
-
-        if matches!(c, b'"' | b'\'' | b'`') {
-            let quote = c;
-            out.push(c);
-            i += 1;
-            while i < bytes.len() {
-                let sc = bytes[i];
-                out.push(sc);
-                i += 1;
-                if sc == b'\\' {
-                    if i < bytes.len() {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                } else if sc == quote {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if is_ws(c) {
-            let mut j = i;
-            while j < bytes.len() && is_ws(bytes[j]) {
-                j += 1;
-            }
-            let prev = out.last().copied();
-            let next = bytes.get(j).copied();
-            if let (Some(p), Some(n)) = (prev, next) {
-                if needs_separator(p, n) {
-                    out.push(b' ');
-                }
-            }
-            i = j;
-            continue;
-        }
-
-        out.push(c);
-        i += 1;
-    }
-
-    String::from_utf8(out).expect("minifier preserves UTF-8 boundaries")
-}
-
-fn is_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
-}
-
-/// Bytes that can appear inside a JS identifier or numeric literal.
-/// Any byte with the high bit set is assumed to be part of a multi-byte
-/// UTF-8 identifier character — we keep separators in that case rather
-/// than risk gluing a keyword onto a Unicode identifier.
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
-}
-
-/// Decide whether two adjacent non-whitespace bytes need a space between
-/// them to remain two distinct tokens.
-fn needs_separator(prev: u8, next: u8) -> bool {
-    if is_ident_byte(prev) && is_ident_byte(next) {
-        return true;
-    }
-    // `+ +` must not become `++`, same for `-`. Mongoose JS tokens like
-    // `++`/`--` are single tokens; re-combining would change semantics.
-    if (prev == b'+' && next == b'+') || (prev == b'-' && next == b'-') {
-        return true;
-    }
-    false
+        String::from_utf8(buf).map_err(|e| MinifyError(format!("non-UTF8 codegen output: {e}")))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn min(src: &str) -> String {
+        minify(src).expect("minify should succeed")
+    }
+
     #[test]
-    fn strips_line_comment() {
-        assert_eq!(
-            minify("let x = 1; // a comment\nlet y = 2;"),
-            "let x=1;let y=2;"
+    fn strips_comments() {
+        let out = min("// header\nlet x = 1; /* mid */ let y = 2;\n");
+        assert!(!out.contains("//"));
+        assert!(!out.contains("/*"));
+    }
+
+    #[test]
+    fn mangles_top_level_identifier() {
+        // A long top-level identifier should get renamed to something short.
+        let out = min("let WASHER_SWITCH_ID = 3; print(WASHER_SWITCH_ID);");
+        assert!(
+            !out.contains("WASHER_SWITCH_ID"),
+            "expected identifier mangling, got: {out}"
         );
     }
 
     #[test]
-    fn strips_block_comment() {
-        assert_eq!(minify("let /* inline */ x = 1;"), "let x=1;");
+    fn preserves_unresolved_globals() {
+        // `Shelly` is a free identifier — must not be renamed.
+        let out = min("Shelly.call(\"Switch.GetStatus\", { id: 0 });");
+        assert!(
+            out.contains("Shelly"),
+            "expected Shelly to survive, got: {out}"
+        );
+    }
+
+    #[test]
+    fn does_not_emit_arrow_functions() {
+        // We target ES5 so the engine on-device (mJS) can parse the output.
+        let out = min(
+            "function tick() { Timer.set(2000, true, function () { print(\"hi\"); }); } tick();",
+        );
+        assert!(
+            !out.contains("=>"),
+            "expected no arrow functions in ES5 output, got: {out}"
+        );
     }
 
     #[test]
     fn preserves_string_contents() {
-        let src = r#"print("hello // not a comment /* nope */");"#;
-        assert_eq!(
-            minify(src),
-            r#"print("hello // not a comment /* nope */");"#
-        );
+        let out = min(r#"print("hello // not a comment /* nope */");"#);
+        assert!(out.contains("hello // not a comment /* nope */"));
     }
 
     #[test]
-    fn preserves_escaped_quotes() {
-        let src = r#"let s = "she said \"hi\"";"#;
-        assert_eq!(minify(src), r#"let s="she said \"hi\"";"#);
-    }
-
-    #[test]
-    fn preserves_template_literals() {
-        let src = "let s = `a // b ${x} c`;";
-        assert_eq!(minify(src), "let s=`a // b ${x} c`;");
-    }
-
-    #[test]
-    fn keeps_space_between_keyword_and_ident() {
-        assert_eq!(minify("return x;"), "return x;");
-        assert_eq!(minify("typeof  y"), "typeof y");
-    }
-
-    #[test]
-    fn strips_space_around_operators() {
-        assert_eq!(minify("a = b + c * d"), "a=b+c*d");
-    }
-
-    #[test]
-    fn keeps_plus_plus_apart() {
-        // `a+ +b` is `a + (+b)`, different from `a++b`.
-        assert_eq!(minify("a + +b"), "a+ +b");
-        assert_eq!(minify("a - -b"), "a- -b");
-    }
-
-    #[test]
-    fn collapses_blank_lines() {
-        let src = "let a = 1;\n\n\nlet b = 2;\n";
-        assert_eq!(minify(src), "let a=1;let b=2;");
-    }
-
-    #[test]
-    fn handles_unterminated_block_comment() {
-        // Don't panic — consume to end.
-        assert_eq!(minify("a /* dangling"), "a");
-    }
-
-    #[test]
-    fn handles_unterminated_string() {
-        let src = r#"let s = "oops"#;
-        // Should not panic; copy the string bytes verbatim.
-        let out = minify(src);
-        assert!(out.contains("\"oops"));
-    }
-
-    #[test]
-    fn preserves_non_ascii_identifier() {
-        // If a user has an identifier with non-ASCII bytes, don't glue it
-        // to an adjacent keyword.
-        let src = "let α = 1; return α;";
-        let out = minify(src);
-        // We expect the α to be preserved and separated from `return`.
-        assert!(out.contains("return α"));
+    fn returns_error_on_invalid_syntax() {
+        assert!(minify("function (").is_err());
     }
 
     #[test]
     fn empty_input() {
-        assert_eq!(minify(""), "");
-    }
-
-    #[test]
-    fn strips_comment_at_end_of_file_without_newline() {
-        assert_eq!(minify("let x=1;//trailing"), "let x=1;");
-    }
-
-    #[test]
-    fn block_comment_between_tokens_becomes_space() {
-        // Ensures `a/*x*/b` doesn't become `ab`.
-        assert_eq!(minify("a/*x*/b"), "a b");
+        let out = min("");
+        assert_eq!(out, "");
     }
 }

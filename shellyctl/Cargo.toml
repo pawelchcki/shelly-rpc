@@ -28,5 +28,15 @@ ureq = "2"
 url = "2"
 axoupdater = { version = "0.10", default-features = false, features = ["blocking", "github_releases"] }
 
+# SWC-based JS minifier (proper parser + scope-aware identifier mangling).
+# Targets ES5 output because Mongoose JS on-device is ES5.1-ish: no arrow
+# functions, no template literals, etc.
+swc_common = "21"
+swc_ecma_ast = "23"
+swc_ecma_codegen = "26"
+swc_ecma_minifier = { version = "52", default-features = false }
+swc_ecma_parser = "39"
+swc_ecma_transforms_base = "42"
+
 [dev-dependencies]
 serde_json = "1"
