@@ -177,13 +177,26 @@ fn base_url(host: &str) -> String {
     }
 }
 
-/// Pull `--minify` from anywhere in a positional-arg slice. Returns
-/// `(minify, remaining_args)`. Accepting it at any position matters
-/// because `script upload [name] <file.js>` is variadic and users
-/// naturally append the flag.
+/// Pull `--minify` from a positional-arg slice. Returns `(minify,
+/// remaining_args)`. Accepts the flag at any position because
+/// `script upload [name] <file.js>` is variadic and users naturally
+/// append it. A `--` sentinel ends flag parsing so a literal value of
+/// `--minify` (e.g. `run <host> -e -- --minify`) survives.
 fn take_minify_flag(args: &[String]) -> (bool, Vec<String>) {
-    let minify = args.iter().any(|s| s == "--minify");
-    let rest = args.iter().filter(|s| *s != "--minify").cloned().collect();
+    let mut minify = false;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut end_of_options = false;
+    for arg in args {
+        if end_of_options {
+            rest.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => end_of_options = true,
+            "--minify" => minify = true,
+            _ => rest.push(arg.clone()),
+        }
+    }
     (minify, rest)
 }
 
@@ -241,16 +254,17 @@ fn run_compile(args: &[String]) -> ExitCode {
         Ok(m) => m,
         Err(c) => return c,
     };
+    let ratio = if source_len == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{}%", minified.len() * 100 / source_len)
+    };
     eprintln!(
-        "{}: {} -> {} bytes ({}%)",
+        "{}: {} -> {} bytes ({})",
         input,
         source_len,
         minified.len(),
-        if source_len == 0 {
-            100
-        } else {
-            minified.len() * 100 / source_len
-        },
+        ratio,
     );
     warn_if_oversize(minified.len());
 
@@ -1133,6 +1147,14 @@ mod take_minify_flag_tests {
         let (minify, rest) = take_minify_flag(&args);
         assert!(!minify);
         assert_eq!(rest, strings(&["name", "upload.js"]));
+    }
+
+    #[test]
+    fn double_dash_sentinel_preserves_literal_minify() {
+        let args = strings(&["-e", "--", "--minify"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(!minify);
+        assert_eq!(rest, strings(&["-e", "--minify"]));
     }
 }
 
