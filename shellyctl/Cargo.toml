@@ -37,6 +37,10 @@ swc_ecma_codegen = "26"
 swc_ecma_minifier = { version = "52", default-features = false }
 swc_ecma_parser = "39"
 swc_ecma_transforms_base = "42"
+# block_scoping (let/const → var) and arrow conversion. Without this,
+# the minifier passes ES2015+ declarations through unchanged and the
+# device's Mongoose JS engine refuses to load the script.
+swc_ecma_compat_es2015 = "46"
 
 [dev-dependencies]
 serde_json = "1"

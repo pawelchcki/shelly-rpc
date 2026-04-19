@@ -204,17 +204,30 @@ fn maybe_minify(source: String, enabled: bool, source_name: &str) -> Result<Stri
     })
 }
 
-fn run_compile(args: &[String]) -> ExitCode {
-    let Some(input) = args.first() else {
-        eprintln!("usage: shellyctl compile <input.js> [-o output.js]");
-        return ExitCode::from(2);
-    };
+/// On-device script size limit (CLAUDE.md). Exceeding this means the
+/// device will refuse to load the script.
+const SCRIPT_SIZE_BUDGET: usize = 2048;
 
-    let out_path: Option<&str> = match args.len() {
-        1 => None,
-        3 if args[1] == "-o" => Some(args[2].as_str()),
+fn run_compile(args: &[String]) -> ExitCode {
+    let usage = "usage: shellyctl compile <input.js> [-o output.js]";
+
+    let (input, out_path): (&str, Option<&str>) = match args {
+        [input] if !input.starts_with('-') => (input.as_str(), None),
+        [input, flag, path] if !input.starts_with('-') && flag == "-o" => {
+            (input.as_str(), Some(path.as_str()))
+        }
+        [_, flag] if flag == "-o" => {
+            eprintln!("error: -o requires an output path");
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+        [first, ..] if first.starts_with('-') => {
+            eprintln!("error: unexpected flag '{first}' (input file must come first)");
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
         _ => {
-            eprintln!("usage: shellyctl compile <input.js> [-o output.js]");
+            eprintln!("{usage}");
             return ExitCode::from(2);
         }
     };
@@ -239,6 +252,7 @@ fn run_compile(args: &[String]) -> ExitCode {
             minified.len() * 100 / source_len
         },
     );
+    warn_if_oversize(minified.len());
 
     match out_path {
         Some(path) => match std::fs::write(path, &minified) {
@@ -252,9 +266,26 @@ fn run_compile(args: &[String]) -> ExitCode {
             }
         },
         None => {
-            print!("{minified}");
-            ExitCode::SUCCESS
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            match stdout.lock().write_all(minified.as_bytes()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error writing to stdout: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
+    }
+}
+
+fn warn_if_oversize(len: usize) {
+    if len > SCRIPT_SIZE_BUDGET {
+        eprintln!(
+            "warning: {len} bytes exceeds the {SCRIPT_SIZE_BUDGET}-byte on-device limit; \
+             the device will likely refuse to load this script"
+        );
     }
 }
 
@@ -933,6 +964,7 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
             };
             if do_minify {
                 eprintln!("Minified {} -> {} bytes", source_len, code.len());
+                warn_if_oversize(code.len());
             }
 
             let created = match device.script_create(&name, &mut buf).await {

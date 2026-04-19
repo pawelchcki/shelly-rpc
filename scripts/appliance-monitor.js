@@ -60,7 +60,6 @@ let POLL_INTERVAL_MS = 2000;
 let washerState = { s: "idle", since: 0, rs: 0, re: 0 };
 let dryerState  = { s: "idle", since: 0, rs: 0, re: 0 };
 
-// Loaded from KVS at startup; remains null until then.
 let cloud = null;
 
 // ---------- Helpers ---------------------------------------------------------
@@ -102,7 +101,6 @@ function checkAppliance(state, switchId, doneSeconds, startSceneId, doneSceneId)
     let energyTotal  = status.aenergy ? status.aenergy.total : 0;
 
     if (state.s === "idle") {
-      // Watch for power crossing the start threshold.
       if (powerW > START_THRESHOLD_W) {
         state.s     = "starting";
         state.since = now;
@@ -111,8 +109,6 @@ function checkAppliance(state, switchId, doneSeconds, startSceneId, doneSceneId)
     }
 
     if (state.s === "starting") {
-      // Either the spike was transient (drop back to idle) or it has
-      // held long enough to call this a real run.
       if (powerW <= START_THRESHOLD_W) {
         state.s     = "idle";
         state.since = 0;
