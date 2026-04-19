@@ -43,3 +43,15 @@ allow-dirty = ["ci"]
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Aggressive size-optimized build. Trades compile time (~3-5x slower
+# than release) for binary size. Use when shipping the CLI:
+#   cargo build -p shellyctl --profile optimized-release
+[profile.optimized-release]
+inherits = "release"
+opt-level = "z"      # optimize for size, not speed
+lto = "fat"          # whole-program LTO across all crates
+codegen-units = 1    # single codegen unit lets LLVM inline more aggressively
+strip = "symbols"    # drop debug + symbol tables
+panic = "abort"      # skip unwinding tables (CLI dies on panic anyway)
+incremental = false  # incremental compilation defeats codegen-units = 1
