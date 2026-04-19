@@ -3,6 +3,7 @@
 //! Uses the `shelly-rpc` async library over a tokio-backed network stack.
 
 mod cloud;
+mod minify;
 mod nal;
 mod self_update;
 
@@ -118,29 +119,33 @@ fn main() -> ExitCode {
         }
         "run" => {
             let Some(host) = args.first() else {
-                eprintln!("error: `run` requires <host> <file.js|-e 'code'>");
+                eprintln!("error: `run` requires <host> [--minify] <file.js|-e 'code'>");
                 return ExitCode::from(2);
             };
-            let code = if args.get(1).map(|s| s.as_str()) == Some("-e") {
-                let Some(expr) = args.get(2) else {
+            let (do_minify, rest) = take_minify_flag(&args[1..]);
+            let (code, source_name) = if rest.first().map(|s| s.as_str()) == Some("-e") {
+                let Some(expr) = rest.get(1) else {
                     eprintln!("error: `-e` requires a code argument");
                     return ExitCode::from(2);
                 };
-                expr.clone()
-            } else if let Some(path) = args.get(1) {
-                match std::fs::read_to_string(path) {
+                (expr.clone(), "<-e>".to_string())
+            } else if let Some(path) = rest.first() {
+                let code = match read_source(path) {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("error reading {path}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
+                    Err(c) => return c,
+                };
+                (code, path.clone())
             } else {
                 eprintln!("error: `run` requires <file.js> or -e 'code'");
                 return ExitCode::from(2);
             };
+            let code = match maybe_minify(code, do_minify, &source_name) {
+                Ok(c) => c,
+                Err(c) => return c,
+            };
             run_async(run_script_ephemeral(host, &code))
         }
+        "compile" => run_compile(&args),
         "self-update" => self_update::run(),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -169,6 +174,132 @@ fn base_url(host: &str) -> String {
         host.to_string()
     } else {
         format!("http://{host}")
+    }
+}
+
+/// Pull `--minify` from a positional-arg slice. Returns `(minify,
+/// remaining_args)`. Accepts the flag at any position because
+/// `script upload [name] <file.js>` is variadic and users naturally
+/// append it. A `--` sentinel ends flag parsing so a literal value of
+/// `--minify` (e.g. `run <host> -e -- --minify`) survives.
+fn take_minify_flag(args: &[String]) -> (bool, Vec<String>) {
+    let mut minify = false;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut end_of_options = false;
+    for arg in args {
+        if end_of_options {
+            rest.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => end_of_options = true,
+            "--minify" => minify = true,
+            _ => rest.push(arg.clone()),
+        }
+    }
+    (minify, rest)
+}
+
+fn read_source(path: &str) -> Result<String, ExitCode> {
+    std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("error: reading {path}: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+fn maybe_minify(source: String, enabled: bool, source_name: &str) -> Result<String, ExitCode> {
+    if !enabled {
+        return Ok(source);
+    }
+    minify::minify(&source, source_name).map_err(|e| {
+        eprintln!("error: minification failed: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+/// On-device script size limit (CLAUDE.md). Exceeding this means the
+/// device will refuse to load the script.
+const SCRIPT_SIZE_BUDGET: usize = 2048;
+
+fn run_compile(args: &[String]) -> ExitCode {
+    let usage = "usage: shellyctl compile <input.js> [-o output.js]";
+
+    let (input, out_path): (&str, Option<&str>) = match args {
+        [input] if !input.starts_with('-') => (input.as_str(), None),
+        [input, flag, path] if !input.starts_with('-') && flag == "-o" => {
+            (input.as_str(), Some(path.as_str()))
+        }
+        [_, flag] if flag == "-o" => {
+            eprintln!("error: -o requires an output path");
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+        [first, ..] if first.starts_with('-') => {
+            eprintln!("error: unexpected flag '{first}' (input file must come first)");
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+        _ => {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let source = match read_source(input) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let source_len = source.len();
+    let minified = match maybe_minify(source, true, input) {
+        Ok(m) => m,
+        Err(c) => return c,
+    };
+    let ratio = if source_len == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{}%", minified.len() * 100 / source_len)
+    };
+    eprintln!(
+        "{}: {} -> {} bytes ({})",
+        input,
+        source_len,
+        minified.len(),
+        ratio,
+    );
+    warn_if_oversize(minified.len());
+
+    match out_path {
+        Some(path) => match std::fs::write(path, &minified) {
+            Ok(()) => {
+                eprintln!("Wrote {path}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error writing {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            match stdout.lock().write_all(minified.as_bytes()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error writing to stdout: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn warn_if_oversize(len: usize) {
+    if len >= SCRIPT_SIZE_BUDGET {
+        eprintln!(
+            "warning: {len} bytes meets or exceeds the {SCRIPT_SIZE_BUDGET}-byte on-device limit; \
+             the device will likely refuse to load this script"
+        );
     }
 }
 
@@ -816,6 +947,7 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
             }
         },
         "upload" => {
+            let (do_minify, args) = take_minify_flag(args);
             let (name, file_path) = match args.len() {
                 1 => {
                     let p = &args[0];
@@ -826,22 +958,28 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                         );
                         return ExitCode::FAILURE;
                     };
-                    (n.to_string(), p.as_str())
+                    (n.to_string(), p.clone())
                 }
-                2 => (args[0].clone(), args[1].as_str()),
+                2 => (args[0].clone(), args[1].clone()),
                 _ => {
-                    eprintln!("usage: shellyctl script <host> upload [name] <file.js>");
+                    eprintln!("usage: shellyctl script <host> upload [--minify] [name] <file.js>");
                     return ExitCode::from(2);
                 }
             };
 
-            let code = match std::fs::read_to_string(file_path) {
+            let source = match read_source(&file_path) {
                 Ok(c) => c,
-                Err(e) => {
-                    eprintln!("error reading {file_path}: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(c) => return c,
             };
+            let source_len = source.len();
+            let code = match maybe_minify(source, do_minify, &file_path) {
+                Ok(c) => c,
+                Err(c) => return c,
+            };
+            if do_minify {
+                eprintln!("Minified {} -> {} bytes", source_len, code.len());
+                warn_if_oversize(code.len());
+            }
 
             let created = match device.script_create(&name, &mut buf).await {
                 Ok(c) => c,
@@ -947,12 +1085,13 @@ fn usage() -> ExitCode {
              status   <host>                     Fetch and display device status\n    \
              update   <host>                     Install available firmware update\n    \
              script   <host> list                List scripts\n    \
-             script   <host> upload [name] <js>  Create + upload a script\n    \
+             script   <host> upload [--minify] [name] <js>  Create + upload a script (use --minify to compile first)\n    \
              script   <host> start <id>          Start a script\n    \
              script   <host> stop  <id>          Stop a script\n    \
              script   <host> delete <id>         Delete a script\n    \
-             run      <host> <file.js>             Run a script ephemerally with log streaming\n    \
-             run      <host> -e 'code'            Run inline JS ephemerally\n    \
+             compile  <in.js> [-o out.js]        Minify a script (stdout if no -o)\n    \
+             run      <host> [--minify] <file.js>   Run a script ephemerally (use --minify to compile first)\n    \
+             run      <host> [--minify] -e 'code'   Run inline JS ephemerally\n    \
              logs     <host>                     Stream device debug log\n    \
              record   <host> <dir>               Record RPC responses\n    \
              call     <host> <method>            Call a raw RPC method\n    \
@@ -968,6 +1107,55 @@ fn usage() -> ExitCode {
         version = env!("CARGO_PKG_VERSION"),
     );
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod take_minify_flag_tests {
+    use super::take_minify_flag;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn accepts_flag_at_end() {
+        let args = strings(&["script.js", "--minify"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(minify);
+        assert_eq!(rest, strings(&["script.js"]));
+    }
+
+    #[test]
+    fn accepts_flag_in_middle_and_preserves_order() {
+        let args = strings(&["name", "--minify", "upload.js"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(minify);
+        assert_eq!(rest, strings(&["name", "upload.js"]));
+    }
+
+    #[test]
+    fn removes_multiple_occurrences() {
+        let args = strings(&["--minify", "script.js", "--minify"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(minify);
+        assert_eq!(rest, strings(&["script.js"]));
+    }
+
+    #[test]
+    fn returns_original_args_when_flag_missing() {
+        let args = strings(&["name", "upload.js"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(!minify);
+        assert_eq!(rest, strings(&["name", "upload.js"]));
+    }
+
+    #[test]
+    fn double_dash_sentinel_preserves_literal_minify() {
+        let args = strings(&["-e", "--", "--minify"]);
+        let (minify, rest) = take_minify_flag(&args);
+        assert!(!minify);
+        assert_eq!(rest, strings(&["-e", "--minify"]));
+    }
 }
 
 #[cfg(test)]
