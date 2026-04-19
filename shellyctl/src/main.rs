@@ -123,7 +123,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             let rest = &args[1..];
-            let (raw, rest) = take_raw_flag(rest);
+            let (do_minify, rest) = take_minify_flag(rest);
             let code = if rest.first().map(|s| s.as_str()) == Some("-e") {
                 let Some(expr) = rest.get(1) else {
                     eprintln!("error: `-e` requires a code argument");
@@ -142,7 +142,11 @@ fn main() -> ExitCode {
                 eprintln!("error: `run` requires <file.js> or -e 'code'");
                 return ExitCode::from(2);
             };
-            let code = if raw { code } else { minify::minify(&code) };
+            let code = if do_minify {
+                minify::minify(&code)
+            } else {
+                code
+            };
             run_async(run_script_ephemeral(host, &code))
         }
         "compile" => run_compile(&args),
@@ -177,11 +181,11 @@ fn base_url(host: &str) -> String {
     }
 }
 
-/// Pull an optional `--raw` flag off the front of a positional-arg slice.
-/// Returns `(raw, remaining_args)`.
-fn take_raw_flag(args: &[String]) -> (bool, &[String]) {
+/// Pull an optional `--minify` flag off the front of a positional-arg slice.
+/// Returns `(minify, remaining_args)`.
+fn take_minify_flag(args: &[String]) -> (bool, &[String]) {
     match args.first() {
-        Some(s) if s == "--raw" => (true, &args[1..]),
+        Some(s) if s == "--minify" => (true, &args[1..]),
         _ => (false, args),
     }
 }
@@ -885,7 +889,7 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
             }
         },
         "upload" => {
-            let (raw, args) = take_raw_flag(args);
+            let (do_minify, args) = take_minify_flag(args);
             let (name, file_path) = match args.len() {
                 1 => {
                     let p = &args[0];
@@ -900,7 +904,7 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                 }
                 2 => (args[0].clone(), args[1].as_str()),
                 _ => {
-                    eprintln!("usage: shellyctl script <host> upload [--raw] [name] <file.js>");
+                    eprintln!("usage: shellyctl script <host> upload [--minify] [name] <file.js>");
                     return ExitCode::from(2);
                 }
             };
@@ -912,12 +916,12 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let code = if raw {
-                source
-            } else {
+            let code = if do_minify {
                 let minified = minify::minify(&source);
                 eprintln!("Minified {} -> {} bytes", source.len(), minified.len());
                 minified
+            } else {
+                source
             };
 
             let created = match device.script_create(&name, &mut buf).await {
@@ -1024,13 +1028,13 @@ fn usage() -> ExitCode {
              status   <host>                     Fetch and display device status\n    \
              update   <host>                     Install available firmware update\n    \
              script   <host> list                List scripts\n    \
-             script   <host> upload [--raw] [name] <js>  Create + upload a script (minified by default)\n    \
+             script   <host> upload [--minify] [name] <js>  Create + upload a script (use --minify to compile first)\n    \
              script   <host> start <id>          Start a script\n    \
              script   <host> stop  <id>          Stop a script\n    \
              script   <host> delete <id>         Delete a script\n    \
              compile  <in.js> [-o out.js]        Minify a script (stdout if no -o)\n    \
-             run      <host> [--raw] <file.js>   Run a script ephemerally (minified by default)\n    \
-             run      <host> [--raw] -e 'code'   Run inline JS ephemerally\n    \
+             run      <host> [--minify] <file.js>   Run a script ephemerally (use --minify to compile first)\n    \
+             run      <host> [--minify] -e 'code'   Run inline JS ephemerally\n    \
              logs     <host>                     Stream device debug log\n    \
              record   <host> <dir>               Record RPC responses\n    \
              call     <host> <method>            Call a raw RPC method\n    \
