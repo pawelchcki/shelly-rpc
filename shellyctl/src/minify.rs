@@ -1,13 +1,9 @@
 //! SWC-backed minifier for mJS scripts.
 //!
-//! Uses `swc_ecma_minifier` for scope-aware identifier mangling and
-//! whitespace removal. Output is targeted at ES5 because the on-device
-//! Mongoose JS engine doesn't support arrow functions, template
-//! literals, classes, destructuring, etc. — features the minifier would
-//! otherwise emit when collapsing expressions.
-//!
-//! Failures (parse errors, codegen errors) propagate so callers can
-//! surface them instead of silently uploading the unminified source.
+//! Output is targeted at ES5 because the on-device Mongoose JS engine
+//! doesn't support arrow functions, template literals, classes,
+//! destructuring, etc. — features the minifier would otherwise emit
+//! when collapsing expressions.
 
 use std::sync::Arc;
 
@@ -136,7 +132,6 @@ mod tests {
 
     #[test]
     fn mangles_top_level_identifier() {
-        // A long top-level identifier should get renamed to something short.
         let out = min("let WASHER_SWITCH_ID = 3; print(WASHER_SWITCH_ID);");
         assert!(
             !out.contains("WASHER_SWITCH_ID"),
@@ -146,7 +141,6 @@ mod tests {
 
     #[test]
     fn preserves_unresolved_globals() {
-        // `Shelly` is a free identifier — must not be renamed.
         let out = min("Shelly.call(\"Switch.GetStatus\", { id: 0 });");
         assert!(
             out.contains("Shelly"),
@@ -156,7 +150,6 @@ mod tests {
 
     #[test]
     fn does_not_emit_arrow_functions() {
-        // We target ES5 so the engine on-device (mJS) can parse the output.
         let out = min(
             "function tick() { Timer.set(2000, true, function () { print(\"hi\"); }); } tick();",
         );

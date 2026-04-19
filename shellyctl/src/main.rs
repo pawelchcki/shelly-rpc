@@ -122,8 +122,7 @@ fn main() -> ExitCode {
                 eprintln!("error: `run` requires <host> <file.js|-e 'code'>");
                 return ExitCode::from(2);
             };
-            let rest = &args[1..];
-            let (do_minify, rest) = take_minify_flag(rest);
+            let (do_minify, rest) = take_minify_flag(&args[1..]);
             let code = if rest.first().map(|s| s.as_str()) == Some("-e") {
                 let Some(expr) = rest.get(1) else {
                     eprintln!("error: `-e` requires a code argument");
@@ -131,27 +130,17 @@ fn main() -> ExitCode {
                 };
                 expr.clone()
             } else if let Some(path) = rest.first() {
-                match std::fs::read_to_string(path) {
+                match read_source(path) {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("error reading {path}: {e}");
-                        return ExitCode::FAILURE;
-                    }
+                    Err(c) => return c,
                 }
             } else {
                 eprintln!("error: `run` requires <file.js> or -e 'code'");
                 return ExitCode::from(2);
             };
-            let code = if do_minify {
-                match minify::minify(&code) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("error: minification failed: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                code
+            let code = match maybe_minify(code, do_minify) {
+                Ok(c) => c,
+                Err(c) => return c,
             };
             run_async(run_script_ephemeral(host, &code))
         }
@@ -187,17 +176,33 @@ fn base_url(host: &str) -> String {
     }
 }
 
-/// Pull an optional `--minify` flag off the front of a positional-arg slice.
-/// Returns `(minify, remaining_args)`.
-fn take_minify_flag(args: &[String]) -> (bool, &[String]) {
-    match args.first() {
-        Some(s) if s == "--minify" => (true, &args[1..]),
-        _ => (false, args),
-    }
+/// Pull `--minify` from anywhere in a positional-arg slice. Returns
+/// `(minify, remaining_args)`. Accepting it at any position matters
+/// because `script upload [name] <file.js>` is variadic and users
+/// naturally append the flag.
+fn take_minify_flag(args: &[String]) -> (bool, Vec<String>) {
+    let minify = args.iter().any(|s| s == "--minify");
+    let rest = args.iter().filter(|s| *s != "--minify").cloned().collect();
+    (minify, rest)
 }
 
-/// `compile <input.js> [-o output.js]` — read a source file, minify it,
-/// and either write the result to `output.js` or print it to stdout.
+fn read_source(path: &str) -> Result<String, ExitCode> {
+    std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("error reading {path}: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+fn maybe_minify(source: String, enabled: bool) -> Result<String, ExitCode> {
+    if !enabled {
+        return Ok(source);
+    }
+    minify::minify(&source).map_err(|e| {
+        eprintln!("error: minification failed: {e}");
+        ExitCode::FAILURE
+    })
+}
+
 fn run_compile(args: &[String]) -> ExitCode {
     let Some(input) = args.first() else {
         eprintln!("usage: shellyctl compile <input.js> [-o output.js]");
@@ -213,29 +218,24 @@ fn run_compile(args: &[String]) -> ExitCode {
         }
     };
 
-    let source = match std::fs::read_to_string(input) {
+    let source = match read_source(input) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {input}: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(c) => return c,
     };
-    let minified = match minify::minify(&source) {
+    let source_len = source.len();
+    let minified = match maybe_minify(source, true) {
         Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: minification failed: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(c) => return c,
     };
     eprintln!(
         "{}: {} -> {} bytes ({}%)",
         input,
-        source.len(),
+        source_len,
         minified.len(),
-        if source.is_empty() {
+        if source_len == 0 {
             100
         } else {
-            minified.len() * 100 / source.len()
+            minified.len() * 100 / source_len
         },
     );
 
@@ -912,36 +912,27 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                         );
                         return ExitCode::FAILURE;
                     };
-                    (n.to_string(), p.as_str())
+                    (n.to_string(), p.clone())
                 }
-                2 => (args[0].clone(), args[1].as_str()),
+                2 => (args[0].clone(), args[1].clone()),
                 _ => {
                     eprintln!("usage: shellyctl script <host> upload [--minify] [name] <file.js>");
                     return ExitCode::from(2);
                 }
             };
 
-            let source = match std::fs::read_to_string(file_path) {
+            let source = match read_source(&file_path) {
                 Ok(c) => c,
-                Err(e) => {
-                    eprintln!("error reading {file_path}: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(c) => return c,
             };
-            let code = if do_minify {
-                match minify::minify(&source) {
-                    Ok(minified) => {
-                        eprintln!("Minified {} -> {} bytes", source.len(), minified.len());
-                        minified
-                    }
-                    Err(e) => {
-                        eprintln!("error: minification failed: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                source
+            let source_len = source.len();
+            let code = match maybe_minify(source, do_minify) {
+                Ok(c) => c,
+                Err(c) => return c,
             };
+            if do_minify {
+                eprintln!("Minified {} -> {} bytes", source_len, code.len());
+            }
 
             let created = match device.script_create(&name, &mut buf).await {
                 Ok(c) => c,
