@@ -295,9 +295,9 @@ fn run_compile(args: &[String]) -> ExitCode {
 }
 
 fn warn_if_oversize(len: usize) {
-    if len > SCRIPT_SIZE_BUDGET {
+    if len >= SCRIPT_SIZE_BUDGET {
         eprintln!(
-            "warning: {len} bytes exceeds the {SCRIPT_SIZE_BUDGET}-byte on-device limit; \
+            "warning: {len} bytes meets or exceeds the {SCRIPT_SIZE_BUDGET}-byte on-device limit; \
              the device will likely refuse to load this script"
         );
     }

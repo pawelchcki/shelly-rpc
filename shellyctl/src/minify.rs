@@ -74,7 +74,7 @@ impl std::fmt::Display for MinifyError {
             MinifyError::NonUtf8(e) => write!(f, "non-UTF8 codegen output: {e}"),
             MinifyError::Verify(msg) => write!(
                 f,
-                "minified output failed to re-parse as ES5 (likely a minifier bug, would crash the device): {msg}"
+                "minified output failed to re-parse as ES5 (likely a minifier bug, would fail to load on the device): {msg}"
             ),
         }
     }
