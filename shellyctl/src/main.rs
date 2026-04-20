@@ -9,9 +9,74 @@ mod self_update;
 
 use std::process::ExitCode;
 
-use shelly_rpc::Device;
+use shelly_rpc::{Device, Error as RpcError};
 
 use crate::nal::StdStack;
+
+/// Maximum code bytes per `Script.PutCode` POST. Chosen with a safety
+/// margin under the measured 8192 B body limit — the JSON envelope plus
+/// escape expansion (quotes, backslashes, newlines) can add several
+/// hundred bytes to the wire size, and older firmware may have a smaller
+/// buffer.
+const PUTCODE_CHUNK_BYTES: usize = 6144;
+
+/// Upload `code` to an already-created script slot using one or more
+/// `Script.PutCode` calls. Splits on UTF-8 character boundaries. The
+/// first call uses `append: false` (replaces any prior content); later
+/// calls use `append: true`. Returns the number of chunks sent.
+async fn upload_code_chunked(
+    device: &mut Device<'_, StdStack, StdStack>,
+    id: u32,
+    code: &str,
+    rx_buf: &mut [u8],
+) -> Result<usize, RpcError> {
+    // Empty code: send one empty PutCode to clear the slot.
+    if code.is_empty() {
+        let mut body = [0u8; 64];
+        device
+            .script_put_code(id, "", false, &mut body, rx_buf)
+            .await?;
+        return Ok(1);
+    }
+
+    let mut sent = 0usize;
+    let mut chunks = 0usize;
+    while sent < code.len() {
+        let remaining = &code[sent..];
+        let take = pick_chunk_len(remaining, PUTCODE_CHUNK_BYTES);
+        let chunk = &remaining[..take];
+        let mut body = vec![0u8; chunk.len() * 2 + 256];
+        device
+            .script_put_code(id, chunk, chunks > 0, &mut body, rx_buf)
+            .await?;
+        sent += take;
+        chunks += 1;
+    }
+    Ok(chunks)
+}
+
+/// Pick an end offset ≤ `max` that lies on a UTF-8 character boundary.
+/// Returns at least 1 — the caller guarantees `!s.is_empty()`.
+fn pick_chunk_len(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    // Safety net: a 4-byte UTF-8 char at `max-3..max+1` could sit across
+    // the boundary; fall back to one character forward if we walked all
+    // the way to zero.
+    if end == 0 {
+        let mut e = 1;
+        while e < s.len() && !s.is_char_boundary(e) {
+            e += 1;
+        }
+        return e;
+    }
+    end
+}
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -217,9 +282,13 @@ fn maybe_minify(source: String, enabled: bool, source_name: &str) -> Result<Stri
     })
 }
 
-/// On-device script size limit (CLAUDE.md). Exceeding this means the
-/// device will refuse to load the script.
-const SCRIPT_SIZE_BUDGET: usize = 2048;
+/// Hard upper bound for the total script body on-device, measured by
+/// binary search on a Shelly 1 Mini Gen3 (fw 1.7.1): the firmware
+/// rejects anything past 65535 bytes with `code -103 "Script length
+/// exceeded 65535 bytes limit!"`. (Per-call `PutCode` POST body is
+/// limited to 8192 B separately; see `PUTCODE_CHUNK_BYTES` — chunked
+/// upload handles that.)
+const SCRIPT_SIZE_BUDGET: usize = 65_535;
 
 fn run_compile(args: &[String]) -> ExitCode {
     let usage = "usage: shellyctl compile <input.js> [-o output.js]";
@@ -297,8 +366,8 @@ fn run_compile(args: &[String]) -> ExitCode {
 fn warn_if_oversize(len: usize) {
     if len >= SCRIPT_SIZE_BUDGET {
         eprintln!(
-            "warning: {len} bytes meets or exceeds the {SCRIPT_SIZE_BUDGET}-byte on-device limit; \
-             the device will likely refuse to load this script"
+            "warning: {len} bytes exceeds the on-device {SCRIPT_SIZE_BUDGET}-byte \
+             total-script ceiling; the device will reject this with error -103"
         );
     }
 }
@@ -683,17 +752,19 @@ async fn run_script_ephemeral(host: &str, code: &str) -> ExitCode {
     let id = created.id;
     eprintln!("Created ephemeral script #{id}");
 
-    let mut body_buf = vec![0u8; code.len() * 2 + 256];
-    if let Err(e) = device
-        .script_put_code(id, code, false, &mut body_buf, &mut buf)
-        .await
-    {
-        eprintln!("error uploading code: {e}");
-        if let Err(ce) = device.script_delete(id, &mut buf).await {
-            eprintln!("warning: failed to delete script #{id}: {ce}");
-            eprintln!("  manually clean up: shellyctl script <host> delete {id}");
+    match upload_code_chunked(&mut device, id, code, &mut buf).await {
+        Ok(chunks) if chunks > 1 => {
+            eprintln!("Uploaded {} bytes in {chunks} chunks", code.len());
         }
-        return ExitCode::FAILURE;
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("error uploading code: {e}");
+            if let Err(ce) = device.script_delete(id, &mut buf).await {
+                eprintln!("warning: failed to delete script #{id}: {ce}");
+                eprintln!("  manually clean up: shellyctl script <host> delete {id}");
+            }
+            return ExitCode::FAILURE;
+        }
     }
 
     if let Err(e) = device.script_start(id, &mut buf).await {
@@ -991,14 +1062,14 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
             let id = created.id;
             eprintln!("Created script #{id} \"{name}\"");
 
-            // Separate body buffer because the JSON envelope + escaped source
-            // can dwarf the response buffer used for `buf`.
-            let mut body_buf = vec![0u8; code.len() * 2 + 256];
-            match device
-                .script_put_code(id, &code, false, &mut body_buf, &mut buf)
-                .await
-            {
-                Ok(r) => eprintln!("Uploaded {} bytes", r.len),
+            match upload_code_chunked(&mut device, id, &code, &mut buf).await {
+                Ok(chunks) => {
+                    if chunks > 1 {
+                        eprintln!("Uploaded {} bytes in {chunks} chunks", code.len());
+                    } else {
+                        eprintln!("Uploaded {} bytes", code.len());
+                    }
+                }
                 Err(e) => {
                     eprintln!("error uploading code: {e}");
                     if let Err(ce) = device.script_delete(id, &mut buf).await {
@@ -1104,7 +1175,7 @@ fn usage() -> ExitCode {
              cloud    init <host> <ws> <wd> <ds> <dd>  Provision scene IDs on device\n    \
              self-update                         Update shellyctl to the latest release\n    \
              help                                Show this message",
-        version = env!("CARGO_PKG_VERSION"),
+        version = env!("SHELLYCTL_VERSION"),
     );
     ExitCode::from(2)
 }
