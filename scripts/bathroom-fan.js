@@ -669,11 +669,16 @@ function onStatusEvent(ev) {
   if (!ev) return;
   let comp = ev.component;
   if (typeof comp !== "string") return;
-  // Filter: only bthomesensor components we care about.
+  // Filter: only bthomesensor components we care about. The sensor id
+  // lives in the component name (e.g. "bthomesensor:200"); the delta
+  // typically only carries `{value, last_updated_ts}`. Using `d.id`
+  // was silently broken — captures fell through to the 5 min poll.
   if (comp.indexOf("bthomesensor:") !== 0) return;
   let d = ev.delta;
   if (!d || typeof d.value !== "number") return;
-  ingestSensorReading(d.id, d.value);
+  let id = parseInt(comp.slice(13), 10);
+  if (isNaN(id)) return;
+  ingestSensorReading(id, d.value);
 }
 
 // ---------- Outdoor (Open-Meteo) --------------------------------------------

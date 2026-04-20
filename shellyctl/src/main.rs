@@ -13,12 +13,15 @@ use shelly_rpc::{Device, Error as RpcError};
 
 use crate::nal::StdStack;
 
-/// Maximum code bytes per `Script.PutCode` POST. Chosen with a safety
-/// margin under the measured 8192 B body limit — the JSON envelope plus
-/// escape expansion (quotes, backslashes, newlines) can add several
-/// hundred bytes to the wire size, and older firmware may have a smaller
-/// buffer.
-const PUTCODE_CHUNK_BYTES: usize = 6144;
+/// Maximum **raw** code bytes per `Script.PutCode` POST. The body sent
+/// on the wire is JSON-encoded (`shelly_rpc::json_escape_into`), and
+/// every `"`, `\`, `\n`, `\r`, `\t`, and control byte doubles in size.
+/// In the worst case the escaped payload is ~2× the raw chunk; we size
+/// for that so even an escape-heavy source still fits under the measured
+/// 8192 B device body limit after the ~40 B JSON envelope. Typical mJS
+/// sources expand by ~5 %, so this is a conservative safety margin, not
+/// an expected one.
+const PUTCODE_CHUNK_BYTES: usize = 4000;
 
 /// Upload `code` to an already-created script slot using one or more
 /// `Script.PutCode` calls. Splits on UTF-8 character boundaries. The

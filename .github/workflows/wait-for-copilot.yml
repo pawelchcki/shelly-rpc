@@ -1,12 +1,10 @@
 name: Wait for Copilot review
 on:
   pull_request: { types: [opened, synchronize, reopened] }
-  pull_request_review: { types: [submitted] }
+permissions:
+  pull-requests: read
 jobs:
   wait:
-    # `pull_request.number` is null on `pull_request_review` events
-    # if the PR lookup hasn't hydrated — only run on actual PR events.
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
