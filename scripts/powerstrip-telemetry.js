@@ -17,7 +17,8 @@
 //   shelly.wifi.{rssi.dbm, connected}
 //   shelly.cloud.connected / shelly.mqtt.connected
 //   shelly.script.{running, mem_free.bytes, cpu.percent, errors_count}
-//   shelly.telemetry.script_runtime_ms   (ms since this script booted)
+//   shelly.telemetry.cycle_duration_ms   (wall-clock time for the
+//                                         previous collection cycle)
 //
 // Controller events (from `appliance-monitor.js`):
 //   appliance.started  → Datadog event "Appliance started (sw<id>)"
@@ -52,8 +53,9 @@ let live = {
   switches: {},    // id -> {on, power, voltage, current, freq, energy, mcu_tc}
 };
 
-// Wall-clock time this script started (ms since epoch).
-let scriptStartMs = 0;
+// End-to-end duration of the previous collectAndPost cycle, in ms.
+// Reported in the *next* cycle so we don't pay an extra HTTP for it.
+let lastCycleMs = null;
 
 function log(m) { print("[dd] " + m); }
 
@@ -260,6 +262,7 @@ function buildSwitchSeries(ts, id) {
 
 function collectAndPost() {
   let ts = nowTs();
+  let startMs = nowMs();
   let sum = {};
   callRpc("Sys.GetStatus", {}, function (r) {
     if (r) {
@@ -285,20 +288,19 @@ function collectAndPost() {
           pushMetric(sysBatch, ts, "shelly.wifi.connected",         sum.wifi_connected);
           pushMetric(sysBatch, ts, "shelly.cloud.connected",        sum.cloud_connected);
           pushMetric(sysBatch, ts, "shelly.mqtt.connected",         sum.mqtt_connected);
-          pushMetric(sysBatch, ts, "shelly.telemetry.script_runtime_ms",
-                     scriptStartMs > 0 ? (nowMs() - scriptStartMs) : null);
-          postAndThen(sysBatch, function () { postSwitches(ts); });
+          pushMetric(sysBatch, ts, "shelly.telemetry.cycle_duration_ms", lastCycleMs);
+          postAndThen(sysBatch, function () { postSwitches(ts, startMs); });
         });
       });
     });
   });
 }
 
-function postSwitches(ts) {
+function postSwitches(ts, startMs) {
   let ids = DD_CFG.switch_ids || [0, 1, 2, 3];
   let i = 0;
   function next() {
-    if (i >= ids.length) { postScriptsBatch(ts); return; }
+    if (i >= ids.length) { postScriptsBatch(ts, startMs); return; }
     let series = buildSwitchSeries(ts, ids[i]);
     i++;
     postAndThen(series, next);
@@ -306,14 +308,18 @@ function postSwitches(ts) {
   next();
 }
 
-function postScriptsBatch(ts) {
+function postScriptsBatch(ts, startMs) {
   callRpc("Script.List", {}, function (lst) {
     let scripts = (lst && lst.scripts) ? lst.scripts : [];
     let i = 0;
     let s = [];
     function walk() {
       if (i >= scripts.length) {
-        postAndThen(s, function () {});
+        postAndThen(s, function () {
+          if (startMs !== null && startMs !== undefined) {
+            lastCycleMs = nowMs() - startMs;
+          }
+        });
         return;
       }
       let sc = scripts[i];
@@ -364,7 +370,6 @@ function seedSwitches(done) {
   next();
 }
 
-scriptStartMs = nowMs();
 callRpc("KVS.Get", { key: "dd_cfg" }, function (res) {
   if (res) {
     try { mergeInto(DD_CFG, JSON.parse(res.value)); }

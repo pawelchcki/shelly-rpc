@@ -38,7 +38,9 @@
 //     shelly.script.cpu.percent
 //     shelly.script.errors_count
 //   Self-telemetry
-//     shelly.telemetry.script_runtime_ms  (ms since this script booted)
+//     shelly.telemetry.cycle_duration_ms  (wall-clock time from first
+//                                          RPC to last HTTP.POST for
+//                                          the previous cycle)
 //
 // Datadog events (low-frequency, high-signal):
 //   "Fan cycle end"    — from fan.cycle_end Shelly event, tagged with
@@ -126,9 +128,11 @@ let outdoor = {
   ts: 0,
 };
 
-// Wall-clock time this script started (ms since epoch). The difference
-// `nowMs() - scriptStartMs` is reported each cycle as script_runtime_ms.
-let scriptStartMs = 0;
+// End-to-end duration of the previous collectAndPost cycle, in ms
+// (from first RPC issued to the last HTTP.POST callback). Reported
+// in the *next* cycle so we don't pay an extra HTTP roundtrip just
+// for this number.
+let lastCycleMs = null;
 
 // ---------- Helpers ---------------------------------------------------------
 
@@ -396,6 +400,7 @@ function postAndThen(series, next) {
 
 function collectAndPost() {
   let ts = nowTs();
+  let startMs = nowMs();
   let sum = {};
   callRpc("Sys.GetStatus", {}, function (r) {
     if (r) {
@@ -450,8 +455,7 @@ function collectAndPost() {
               pushMetric(net, ts, "shelly.wifi.connected",  sum.wifi_connected);
               pushMetric(net, ts, "shelly.cloud.connected", sum.cloud_connected);
               pushMetric(net, ts, "shelly.mqtt.connected",  sum.mqtt_connected);
-              pushMetric(net, ts, "shelly.telemetry.script_runtime_ms",
-                         scriptStartMs > 0 ? (nowMs() - scriptStartMs) : null);
+              pushMetric(net, ts, "shelly.telemetry.cycle_duration_ms", lastCycleMs);
               postAndThen(net, function () {
               // Stage 4: learning batch.
               callRpc("KVS.Get", { key: DD_CFG.fan_stats_kvs_key }, function (r) {
@@ -468,7 +472,7 @@ function collectAndPost() {
                   }
                 }
                 postAndThen(lrn, function () {
-                  collectScripts(ts);
+                  collectScripts(ts, startMs);
                 });
               });
               });
@@ -480,14 +484,19 @@ function collectAndPost() {
   });
 }
 
-function collectScripts(ts) {
+function collectScripts(ts, startMs) {
   callRpc("Script.List", {}, function (lst) {
     let scripts = (lst && lst.scripts) ? lst.scripts : [];
     let i = 0;
     let s = [];
     function next() {
       if (i >= scripts.length) {
-        postAndThen(s, function () {});
+        postAndThen(s, function () {
+          // Cycle complete — record elapsed so the next cycle reports it.
+          if (startMs !== null && startMs !== undefined) {
+            lastCycleMs = nowMs() - startMs;
+          }
+        });
         return;
       }
       let sc = scripts[i];
@@ -541,7 +550,6 @@ function seedLiveState() {
   });
 }
 
-scriptStartMs = nowMs();
 callRpc("KVS.Get", { key: "dd_cfg" }, function (res) {
   if (res) {
     try { mergeInto(DD_CFG, JSON.parse(res.value)); }
