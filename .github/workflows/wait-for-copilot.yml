@@ -1,0 +1,25 @@
+name: Wait for Copilot review
+on:
+  pull_request: { types: [opened, synchronize, reopened] }
+permissions:
+  pull-requests: read
+jobs:
+  wait:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+      REPO:       ${{ github.repository }}
+      PR_NUMBER:  ${{ github.event.pull_request.number }}
+      UPDATED_AT: ${{ github.event.pull_request.updated_at }}
+    steps:
+      - run: |
+          # Bound inputs via env to avoid ${{ }} expansion inside the shell.
+          for i in $(seq 1 60); do
+            got=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+              --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\") | select(.submitted_at > \"$UPDATED_AT\")] | length")
+            [ "$got" -gt 0 ] && exit 0
+            sleep 10
+          done
+          echo "Copilot didn't review within 10 min" >&2
+          exit 1

@@ -26,10 +26,10 @@
 //   rs:    unix time the current run started (set when entering "running")
 //   re:    aenergy.total at the start of the run (Wh baseline for delta)
 //
-// This source is intentionally verbose. Build for the device with:
-//   shellyctl compile scripts/appliance-monitor.js -o build/appliance-monitor.js
-// or upload directly with:
-//   shellyctl script <host> upload --minify scripts/appliance-monitor.js
+// Upload with:
+//   shellyctl script <host> upload scripts/appliance-monitor.js
+// `shellyctl` chunks the PutCode body automatically, so `--minify` is no
+// longer needed for sources over the ~8 KB per-call device limit.
 
 // ---------- Configuration ---------------------------------------------------
 
@@ -53,7 +53,10 @@ let WASHER_DONE_SECONDS = 300;
 let DRYER_DONE_SECONDS  = 120;
 
 // How often we poll Switch.GetStatus on each switch (milliseconds).
-let POLL_INTERVAL_MS = 2000;
+// 10 s is the sweet spot: all state dwell timers below are ≥ 10 s, so
+// nothing reacts faster than this anyway, and wake-ups drop 5× vs the
+// original 2 s setting — lets the ESP32 light-sleep between ticks.
+let POLL_INTERVAL_MS = 10000;
 
 // ---------- Mutable state ---------------------------------------------------
 
@@ -72,6 +75,12 @@ function persistState() {
   Shelly.call("KVS.Set", {
     key:   "mon",
     value: JSON.stringify({ w: washerState, d: dryerState }),
+  }, function (res, err, errMsg) {
+    if (err) {
+      // Invisible KVS failure would leave the state machine thinking
+      // it persisted when it didn't — surface it in the device log.
+      print("!mon save err=" + err + " " + (errMsg || ""));
+    }
   });
 }
 
@@ -120,6 +129,8 @@ function checkAppliance(state, switchId, doneSeconds, startSceneId, doneSceneId)
         persistState();
         print("sw" + switchId + " started");
         triggerCloudScene(startSceneId);
+        // Generic event for any listener (telemetry, MQTT bridge, …).
+        Shelly.emitEvent("appliance.started", { switch_id: switchId });
       }
       return;
     }
@@ -146,6 +157,11 @@ function checkAppliance(state, switchId, doneSeconds, startSceneId, doneSceneId)
         print("sw" + switchId + " done " + durationMinutes + "min " +
               energyWh + "Wh");
         triggerCloudScene(doneSceneId);
+        Shelly.emitEvent("appliance.done", {
+          switch_id:        switchId,
+          duration_minutes: durationMinutes,
+          energy_wh:        energyWh,
+        });
         state.s     = "idle";
         state.rs    = 0;
         state.re    = 0;
