@@ -364,7 +364,8 @@ fn run_compile(args: &[String]) -> ExitCode {
 }
 
 fn warn_if_oversize(len: usize) {
-    if len >= SCRIPT_SIZE_BUDGET {
+    // Device accepts exactly SCRIPT_SIZE_BUDGET bytes; rejects only past it.
+    if len > SCRIPT_SIZE_BUDGET {
         eprintln!(
             "warning: {len} bytes exceeds the on-device {SCRIPT_SIZE_BUDGET}-byte \
              total-script ceiling; the device will reject this with error -103"
@@ -1303,5 +1304,55 @@ mod chunk_decoder_tests {
             d.feed(b"5\r\nhello\r\n", &mut out),
             ChunkOutcome::BrokenPipe
         );
+    }
+}
+
+#[cfg(test)]
+mod pick_chunk_len_tests {
+    use super::pick_chunk_len;
+
+    #[test]
+    fn shorter_than_max_returns_whole_length() {
+        assert_eq!(pick_chunk_len("hello", 100), 5);
+    }
+
+    #[test]
+    fn ascii_exactly_at_max() {
+        assert_eq!(pick_chunk_len("abcdefgh", 4), 4);
+    }
+
+    #[test]
+    fn walks_back_off_utf8_boundary() {
+        // `ä` is two bytes (0xC3 0xA4). With max=4, the boundary at
+        // byte 4 lands mid-char; the helper should walk back to 3.
+        let s = "aaaä";
+        assert_eq!(s.len(), 5);
+        assert_eq!(pick_chunk_len(s, 4), 3);
+    }
+
+    #[test]
+    fn single_multibyte_bigger_than_max_still_advances() {
+        // `𝕏` (U+1D54F) is a single 4-byte UTF-8 codepoint. max=2
+        // forces the pathological `end == 0` branch — the helper must
+        // still advance by one whole character to avoid infinite loops.
+        let s = "𝕏";
+        assert_eq!(s.len(), 4);
+        assert_eq!(pick_chunk_len(s, 2), 4);
+    }
+
+    #[test]
+    fn boundary_hit_returns_max() {
+        // `é` is 2 bytes, so "aé" is 3 bytes; max=3 lies on a char
+        // boundary and should be returned as-is.
+        let s = "aé";
+        assert_eq!(s.len(), 3);
+        assert_eq!(pick_chunk_len(s, 3), 3);
+    }
+
+    #[test]
+    fn returns_at_least_one() {
+        // A non-empty string should always return a positive length;
+        // the caller upload_code_chunked relies on forward progress.
+        assert!(pick_chunk_len("x", 1) >= 1);
     }
 }

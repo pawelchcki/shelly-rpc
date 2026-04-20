@@ -37,6 +37,8 @@
 //     shelly.script.mem_free.bytes
 //     shelly.script.cpu.percent
 //     shelly.script.errors_count
+//   Self-telemetry
+//     shelly.telemetry.script_runtime_ms  (ms since this script booted)
 //
 // Datadog events (low-frequency, high-signal):
 //   "Fan cycle end"    — from fan.cycle_end Shelly event, tagged with
@@ -323,8 +325,6 @@ function ddUrl(path) {
          "?api_key=" + DD_CFG.api_key;
 }
 
-// Kept for compatibility (used by postEvent's error path only).
-function postSeries(series) { postAndThen(series, function () {}); }
 
 function postEvent(title, text, tags, alertType) {
   if (!DD_CFG.api_key) return;
@@ -372,18 +372,23 @@ function postAndThen(series, next) {
     return;
   }
   let body = JSON.stringify({ series: series });
+  let count = series.length;
   callRpc("HTTP.POST", {
     url: ddUrl("/api/v1/series"),
     body: body,
     content_type: "application/json",
     timeout: 15,
   }, function (res, err) {
-    if (!err && res && typeof res.code === "number") {
+    if (err) {
+      log("post dropped " + count + " metric(s)");
+    } else if (res && typeof res.code === "number") {
       if (res.code >= 200 && res.code < 300) {
-        log("posted " + series.length + " metric(s)");
+        log("posted " + count + " metric(s)");
       } else {
-        log("post " + res.code);
+        log("post " + res.code + " dropped " + count);
       }
+    } else {
+      log("post dropped " + count + " (no response)");
     }
     next();
   });

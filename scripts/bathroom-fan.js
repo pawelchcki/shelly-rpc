@@ -32,28 +32,30 @@
 //          +--------+    d(AH)/dt > trigger    +--------+
 //          |  IDLE  |-------------------------->|  ARMED  |
 //          +--------+                           +--------+
-//             ^  ^                                   |
-//             |  | cooldown_s elapsed                | confirm_s elapsed,
-//             |  |                                   | rise persisted
-//             |  |                                   v
-//             |  |                              +----------+
-//             |  |                              |  VENTING |---+
-//             |  |                              +----------+   |
-//             |  |                                   |         |
-//             |  |           plateau:                |         |
-//             |  |         rate < min_eff            |         |
-//             |  |              |                    |         |
-//             |  |              v                    |  futility / floor /
-//             |  |        +-------------+            |  max_run_s
-//             |  |        | EVALUATING  |-- bounce --+         |
-//             |  |        | (fan OFF    |   back             |
-//             |  |        |   90 s)     |   up               v
-//             |  |        +-------------+              +-----------+
-//             |  |              |                      | COOLDOWN  |
-//             |  |  kept falling|                      | (fan OFF  |
-//             |  +--------------+                      |  120 s)   |
-//             |                                        +-----------+
-//             +----------------------------------------------+
+//             ^                                      |
+//             | cooldown_s elapsed                   | confirm_s elapsed,
+//             |                                      | rise persisted
+//             |                                      v
+//             |                                 +----------+
+//             |                                 |  VENTING |---+
+//             |                                 +----------+   |
+//             |                                      |         | futility
+//             |              plateau:                |         | / floor
+//             |            rate < min_eff            |         | / max_run_s
+//             |                 |                    |         |
+//             |                 v                    |         |
+//             |           +-------------+            |         |
+//             |           | EVALUATING  |-- bounce --+         |
+//             |           | (fan OFF    |    back              |
+//             |           |   90 s)     |    up                |
+//             |           +-------------+                      |
+//             |                 |                              |
+//             |          kept falling                          |
+//             |                 |                              |
+//             |                 v                              v
+//             |            +---------------------------------------+
+//             +------------|             COOLDOWN (120 s)          |
+//                          +---------------------------------------+
 //
 // Shower timeline (illustrative)
 // ------------------------------
@@ -139,8 +141,11 @@ let CFG = {
   bthome_humidity_id: 200,
   bthome_temperature_id: 201,
 
-  // Arming thresholds.
-  rise_trigger: 0.05,      // g/m3/s d(AH)/dt required to arm
+  // Arming thresholds. riseRate is a steady-state estimate of dAH/dt
+  // (g/m3/s) from the fast-EMA lag. A moderate shower climbs ~10→20
+  // g/m3 over 3–5 min → rate ≈ 0.03–0.05. 0.03 fires on typical
+  // showers without being noise-sensitive.
+  rise_trigger: 0.03,      // g/m3/s d(AH)/dt required to arm
   confirm_s:    60,        // rise must persist this long in ARMED
 
   // VENTING guards.
@@ -162,12 +167,11 @@ let CFG = {
   // broadcast so the state machine stays responsive).
   weather_poll_s: 900,
   sensor_poll_s:  300,
-  // Raised from 10 s → 30 s: status-handler event path reacts in real
-  // time to BLE broadcasts, so the tick is just a safety net + state
-  // machine heartbeat. 3× fewer wake-ups lets the ESP32 light-sleep
-  // more aggressively. All dwell timers (confirm_s 60, evaluate_s 90,
-  // plateau_window_s 240, cooldown_s 120, max_run_s 1800) comfortably
-  // exceed 30 s, so this doesn't change behaviour.
+  // Status-handler event path reacts in real time to BLE broadcasts,
+  // so the tick is just a safety net + state machine heartbeat. At
+  // 30 s it's 3× fewer wake-ups than the old 10 s, still below all
+  // dwell timers (confirm_s 60 gives 2-tick headroom, evaluate_s 90,
+  // cooldown_s 120, plateau_window_s 240, max_run_s 1800).
   tick_s:         30,
   sensor_stale_s: 600,
 
@@ -288,8 +292,17 @@ function call(method, params, cb) {
 function setFan(on) {
   if (on === fanOn) return;
   fanOn = on;
-  call("Switch.Set", { id: CFG.switch_id, on: on }, null);
   log("fan " + (on ? "ON" : "OFF"));
+  // Route through the logging callback — a failed relay command is the
+  // single highest-consequence failure in this controller (state
+  // machine believes it switched but didn't), so we don't want it
+  // silent. `call()` already logs `!Switch.Set err=...` on failure.
+  call("Switch.Set", { id: CFG.switch_id, on: on }, function (res, err) {
+    if (err) {
+      // Roll back our in-memory belief so the next tick tries again.
+      fanOn = !on;
+    }
+  });
 }
 
 // ---------- Baselines + rise detection --------------------------------------
@@ -388,12 +401,21 @@ function maybeFlushStats() {
       (now - STATS.last_flush_ts) < CFG.stats_save_interval_s) {
     return;
   }
+  // Serialize before the call so the payload reflects the current
+  // EMAs; bump last_flush_ts only on successful persist so a failed
+  // write doesn't start a fresh 24 h coalescing window.
   STATS.last_flush_ts = now;
+  let payload = JSON.stringify(STATS);
   call("KVS.Set", {
     key:   "fan_stats",
-    value: JSON.stringify(STATS),
-  }, null);
-  log("flushed fan_stats (in-memory since last write)");
+    value: payload,
+  }, function (res, err) {
+    if (err) {
+      STATS.last_flush_ts = 0;  // retry next cycle
+      return;
+    }
+    log("flushed fan_stats");
+  });
 }
 
 function clearCycle() {
@@ -682,6 +704,7 @@ function fetchWeather(done) {
     "&current=temperature_2m,relative_humidity_2m";
   call("HTTP.GET", { url: url, timeout: 10 }, function (res, err) {
     if (err || !res || res.code !== 200 || !res.body) {
+      log("!weather http=" + (err ? err : (res && res.code)));
       if (done) done(false);
       return;
     }

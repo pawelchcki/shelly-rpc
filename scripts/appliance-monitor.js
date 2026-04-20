@@ -75,6 +75,12 @@ function persistState() {
   Shelly.call("KVS.Set", {
     key:   "mon",
     value: JSON.stringify({ w: washerState, d: dryerState }),
+  }, function (res, err, errMsg) {
+    if (err) {
+      // Invisible KVS failure would leave the state machine thinking
+      // it persisted when it didn't — surface it in the device log.
+      print("!mon save err=" + err + " " + (errMsg || ""));
+    }
   });
 }
 

@@ -17,6 +17,7 @@
 //   shelly.wifi.{rssi.dbm, connected}
 //   shelly.cloud.connected / shelly.mqtt.connected
 //   shelly.script.{running, mem_free.bytes, cpu.percent, errors_count}
+//   shelly.telemetry.script_runtime_ms   (ms since this script booted)
 //
 // Controller events (from `appliance-monitor.js`):
 //   appliance.started  → Datadog event "Appliance started (sw<id>)"
@@ -184,8 +185,6 @@ function ddUrl(path) {
   return "https://api." + DD_CFG.site + path + "?api_key=" + DD_CFG.api_key;
 }
 
-// Dropped — postAndThen is the only caller now.
-
 function postEvent(title, text, tags, alertType) {
   if (!DD_CFG.api_key) return;
   let body = JSON.stringify({
@@ -209,34 +208,7 @@ function postEvent(title, text, tags, alertType) {
 }
 
 // ---------- Collection passes (memory-lean) ---------------------------------
-
-function postOneSwitch(ts, id) {
-  let slot = live.switches[id];
-  if (!slot) return;
-  let s = [];
-  let tags = switchTags(id);
-  pushMetric(s, ts, "shelly.switch.state",          boolToNum(slot.on), tags);
-  pushMetric(s, ts, "shelly.switch.power.watts",    slot.power,   tags);
-  pushMetric(s, ts, "shelly.switch.voltage.volts",  slot.voltage, tags);
-  pushMetric(s, ts, "shelly.switch.current.amperes", slot.current, tags);
-  pushMetric(s, ts, "shelly.switch.frequency.hz",   slot.freq,    tags);
-  pushMetric(s, ts, "shelly.switch.energy.total.wh", slot.energy, tags);
-  pushMetric(s, ts, "shelly.switch.mcu_temp.celsius", slot.mcu_tc, tags);
-  postSeries(s);
-}
-
-function postSystemBatch(ts, sum) {
-  let s = [];
-  pushMetric(s, ts, "shelly.sys.uptime.seconds",     sum.uptime);
-  pushMetric(s, ts, "shelly.sys.ram_free.bytes",     sum.ram_free);
-  pushMetric(s, ts, "shelly.sys.ram_min_free.bytes", sum.ram_min_free);
-  pushMetric(s, ts, "shelly.wifi.rssi.dbm",          sum.wifi_rssi);
-  pushMetric(s, ts, "shelly.wifi.connected",         sum.wifi_connected);
-  pushMetric(s, ts, "shelly.cloud.connected",        sum.cloud_connected);
-  pushMetric(s, ts, "shelly.mqtt.connected",         sum.mqtt_connected);
-  postSeries(s);
-}
-
+//
 // Fully serialized: each HTTP.POST awaits the previous completion
 // before the next starts. Avoids "too many calls in progress" (~5 cap)
 // and the heap pressure from overlapping JSON payloads.
@@ -249,18 +221,23 @@ function postAndThen(series, next) {
     return;
   }
   let body = JSON.stringify({ series: series });
+  let count = series.length;
   callRpc("HTTP.POST", {
     url: ddUrl("/api/v1/series"),
     body: body,
     content_type: "application/json",
     timeout: 15,
   }, function (res, err) {
-    if (!err && res && typeof res.code === "number") {
+    if (err) {
+      log("post dropped " + count + " metric(s)");
+    } else if (res && typeof res.code === "number") {
       if (res.code >= 200 && res.code < 300) {
-        log("posted " + series.length + " metric(s)");
+        log("posted " + count + " metric(s)");
       } else {
-        log("post " + res.code);
+        log("post " + res.code + " dropped " + count);
       }
+    } else {
+      log("post dropped " + count + " (no response)");
     }
     next();
   });
