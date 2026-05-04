@@ -7,11 +7,148 @@ mod minify;
 mod nal;
 mod self_update;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use clap::{CommandFactory, Parser, Subcommand, ValueHint};
 use shelly_rpc::{Device, Error as RpcError};
 
 use crate::nal::StdStack;
+
+#[derive(Parser)]
+#[command(
+    name = "shellyctl",
+    version = env!("SHELLYCTL_VERSION"),
+    about = "Command-line client for Shelly Gen2+ smart devices",
+    arg_required_else_help = true,
+    disable_help_subcommand = true,
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Discover devices via mDNS
+    Discover {
+        /// Seconds to browse before giving up
+        #[arg(default_value_t = 5)]
+        timeout_secs: u64,
+    },
+    /// Fetch and display device status
+    Status { host: String },
+    /// Install available firmware update
+    Update { host: String },
+    /// Call a raw RPC method
+    Call { host: String, method: String },
+    /// Record GetStatus/GetConfig/etc responses to disk
+    Record {
+        host: String,
+        #[arg(value_hint = ValueHint::DirPath)]
+        out_dir: PathBuf,
+    },
+    /// Stream device debug log
+    Logs { host: String },
+    /// Manage device scripts
+    Script {
+        host: String,
+        #[command(subcommand)]
+        action: ScriptCmd,
+    },
+    /// Minify a script to stdout or a file
+    Compile {
+        #[arg(value_hint = ValueHint::FilePath)]
+        input: PathBuf,
+        /// Output path (stdout if omitted)
+        #[arg(short = 'o', value_name = "OUT", value_hint = ValueHint::FilePath)]
+        output: Option<PathBuf>,
+    },
+    /// Run a script or inline JS expression ephemerally
+    Run {
+        host: String,
+        /// Minify source before upload
+        #[arg(long)]
+        minify: bool,
+        /// Inline JS expression (mutually exclusive with FILE)
+        #[arg(
+            short = 'e',
+            long = "eval",
+            value_name = "CODE",
+            conflicts_with = "file",
+            required_unless_present = "file"
+        )]
+        eval: Option<String>,
+        #[arg(value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+    },
+    /// Shelly Cloud (scene / auth / provisioning)
+    Cloud {
+        #[command(subcommand)]
+        action: CloudCmd,
+    },
+    /// Update shellyctl itself (only when installed via official installer)
+    #[command(name = "self-update")]
+    SelfUpdate,
+    /// Generate shell completions
+    Completions { shell: clap_complete::Shell },
+}
+
+#[derive(Subcommand)]
+enum ScriptCmd {
+    /// List scripts
+    List,
+    /// Create + upload a script
+    Upload {
+        /// Minify source before upload
+        #[arg(long)]
+        minify: bool,
+        /// Script name, or the file path if FILE is omitted
+        name_or_file: String,
+        #[arg(value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+    },
+    /// Start a script
+    Start { id: u32 },
+    /// Stop a script
+    Stop { id: u32 },
+    /// Delete a script
+    Delete { id: u32 },
+}
+
+#[derive(Subcommand)]
+enum CloudCmd {
+    /// Log in with the full Shelly app auth key
+    Login,
+    /// OAuth login via shelly-diy client (limited API scope)
+    #[command(name = "login-diy")]
+    LoginDiy,
+    /// Manage cloud scenes
+    Scene {
+        #[command(subcommand)]
+        action: SceneCmd,
+    },
+    /// Provision cloud scene IDs into device KVS
+    Init {
+        host: String,
+        washer_start: u64,
+        washer_done: u64,
+        dryer_start: u64,
+        dryer_done: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum SceneCmd {
+    /// List cloud scenes
+    List,
+    /// Trigger a cloud scene
+    Run { id: String },
+    /// Create a notification scene
+    Add { name: String, text: String },
+    /// Delete a scene
+    Delete { id: String },
+}
 
 /// Maximum **raw** code bytes per `Script.PutCode` POST. The body sent
 /// on the wire is JSON-encoded (`shelly_rpc::json_escape_into`), and
@@ -82,145 +219,102 @@ fn pick_chunk_len(s: &str, max: usize) -> usize {
 }
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().cloned();
-    let Some(cmd) = cmd else {
-        return usage();
-    };
-    args.remove(0);
+    let cli = Cli::parse();
+    match cli.command {
+        Cmd::Discover { timeout_secs } => run_discover(timeout_secs),
+        Cmd::Status { host } => run_async(run_status(&host)),
+        Cmd::Update { host } => run_async(run_update(&host)),
+        Cmd::Call { host, method } => run_async(run_call(&host, &method)),
+        Cmd::Record { host, out_dir } => run_async(run_record(&host, &out_dir)),
+        Cmd::Logs { host } => run_async(run_logs(&host)),
+        Cmd::Script { host, action } => run_async(run_script(host, action)),
+        Cmd::Compile { input, output } => run_compile(&input, output.as_deref()),
+        Cmd::Run {
+            host,
+            minify,
+            eval,
+            file,
+        } => run_run(&host, minify, eval, file),
+        Cmd::Cloud { action } => run_cloud(action),
+        Cmd::SelfUpdate => self_update::run(),
+        Cmd::Completions { shell } => print_completions(shell),
+    }
+}
 
-    match cmd.as_str() {
-        "status" => {
-            let Some(host) = args.first() else {
-                eprintln!("error: `status` requires a host argument");
-                return ExitCode::from(2);
-            };
-            run_async(run_status(host))
+fn print_completions(shell: clap_complete::Shell) -> ExitCode {
+    use std::io::Write;
+    // `clap_complete::generate` panics on write errors. Buffer first so we
+    // can route I/O failures through our normal exit-code paths instead.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "shellyctl", &mut buf);
+    let stdout = std::io::stdout();
+    match stdout.lock().write_all(&buf) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error writing completions: {e}");
+            ExitCode::FAILURE
         }
-        "update" => {
-            let Some(host) = args.first() else {
-                eprintln!("error: `update` requires a host argument");
-                return ExitCode::from(2);
-            };
-            run_async(run_update(host))
-        }
-        "record" => {
-            if args.len() < 2 {
-                eprintln!("error: `record` requires <host> <out-dir>");
-                return ExitCode::from(2);
-            }
-            run_async(run_record(&args[0], &args[1]))
-        }
-        "call" => {
-            if args.len() < 2 {
-                eprintln!("error: `call` requires <host> <method>");
-                return ExitCode::from(2);
-            }
-            run_async(run_call(&args[0], &args[1]))
-        }
-        "discover" => run_discover(&args),
-        "script" => {
-            let Some(host) = args.first() else {
-                eprintln!("error: `script` requires <host> <action> [args]");
-                return ExitCode::from(2);
-            };
-            let Some(action) = args.get(1) else {
-                eprintln!("error: `script` requires an action (list|upload|start|stop|delete)");
-                return ExitCode::from(2);
-            };
-            run_async(run_script(host, action, &args[2..]))
-        }
-        "cloud" => {
-            let action = args.first().map(|s| s.as_str());
-            match action {
-                Some("login") => cloud::login(),
-                Some("login-diy") => run_async(cloud::login_diy()),
-                Some("scene") => match args.get(1).map(|s| s.as_str()) {
-                    Some("list") => cloud::scene_list(),
-                    Some("run") => {
-                        let Some(id) = args.get(2) else {
-                            eprintln!("usage: shellyctl cloud scene run <id>");
-                            return ExitCode::from(2);
-                        };
-                        cloud::scene_run(id)
-                    }
-                    Some("add") => {
-                        let (Some(name), Some(text)) = (args.get(2), args.get(3)) else {
-                            eprintln!(
-                                "usage: shellyctl cloud scene add <name> <notification-text>"
-                            );
-                            return ExitCode::from(2);
-                        };
-                        cloud::scene_add(name, text)
-                    }
-                    Some("delete") => {
-                        let Some(id) = args.get(2) else {
-                            eprintln!("usage: shellyctl cloud scene delete <id>");
-                            return ExitCode::from(2);
-                        };
-                        cloud::scene_delete(id)
-                    }
-                    _ => {
-                        eprintln!("usage: shellyctl cloud scene <list|run|add|delete>");
-                        ExitCode::from(2)
-                    }
-                },
-                Some("init") => {
-                    if args.len() < 6 {
-                        eprintln!("usage: shellyctl cloud init <host> <washer-start> <washer-done> <dryer-start> <dryer-done>");
-                        return ExitCode::from(2);
-                    }
-                    cloud::init_device(&args[1], &args[2..6])
-                }
-                _ => {
-                    eprintln!("usage: shellyctl cloud <login|login-diy|scene|init>");
-                    ExitCode::from(2)
-                }
-            }
-        }
-        "logs" => {
-            let Some(host) = args.first() else {
-                eprintln!("error: `logs` requires a host argument");
-                return ExitCode::from(2);
-            };
-            run_async(run_logs(host))
-        }
-        "run" => {
-            let Some(host) = args.first() else {
-                eprintln!("error: `run` requires <host> [--minify] <file.js|-e 'code'>");
-                return ExitCode::from(2);
-            };
-            let (do_minify, rest) = take_minify_flag(&args[1..]);
-            let (code, source_name) = if rest.first().map(|s| s.as_str()) == Some("-e") {
-                let Some(expr) = rest.get(1) else {
-                    eprintln!("error: `-e` requires a code argument");
-                    return ExitCode::from(2);
-                };
-                (expr.clone(), "<-e>".to_string())
-            } else if let Some(path) = rest.first() {
-                let code = match read_source(path) {
-                    Ok(c) => c,
-                    Err(c) => return c,
-                };
-                (code, path.clone())
-            } else {
-                eprintln!("error: `run` requires <file.js> or -e 'code'");
-                return ExitCode::from(2);
-            };
-            let code = match maybe_minify(code, do_minify, &source_name) {
+    }
+}
+
+fn run_cloud(action: CloudCmd) -> ExitCode {
+    match action {
+        CloudCmd::Login => cloud::login(),
+        CloudCmd::LoginDiy => run_async(cloud::login_diy()),
+        CloudCmd::Scene { action } => match action {
+            SceneCmd::List => cloud::scene_list(),
+            SceneCmd::Run { id } => cloud::scene_run(&id),
+            SceneCmd::Add { name, text } => cloud::scene_add(&name, &text),
+            SceneCmd::Delete { id } => cloud::scene_delete(&id),
+        },
+        CloudCmd::Init {
+            host,
+            washer_start,
+            washer_done,
+            dryer_start,
+            dryer_done,
+        } => cloud::init_device(
+            &host,
+            &cloud::KvsSceneIds {
+                washer_start,
+                washer_done,
+                dryer_start,
+                dryer_done,
+            },
+        ),
+    }
+}
+
+fn run_run(host: &str, minify: bool, eval: Option<String>, file: Option<PathBuf>) -> ExitCode {
+    let (code, source_name) = match (eval, file) {
+        (Some(expr), None) => (expr, "<-e>".to_string()),
+        (None, Some(path)) => {
+            let code = match read_source(&path) {
                 Ok(c) => c,
                 Err(c) => return c,
             };
-            run_async(run_script_ephemeral(host, &code))
+            (code, path.display().to_string())
         }
-        "compile" => run_compile(&args),
-        "self-update" => self_update::run(),
-        "-h" | "--help" | "help" => usage(),
-        other => {
-            eprintln!("error: unknown command `{other}`");
-            usage()
+        // clap's `required_unless_present` + `conflicts_with` should reject
+        // both other combinations at parse time; the arms below are a
+        // belt-and-braces fallback so attribute drift surfaces as exit 2
+        // rather than a panic.
+        (Some(_), Some(_)) => {
+            eprintln!("error: --eval and FILE are mutually exclusive");
+            return ExitCode::from(2);
         }
-    }
+        (None, None) => {
+            eprintln!("error: `run` requires <file.js> or --eval 'code'");
+            return ExitCode::from(2);
+        }
+    };
+    let code = match maybe_minify(code, minify, &source_name) {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    run_async(run_script_ephemeral(host, &code))
 }
 
 fn run_async(fut: impl std::future::Future<Output = ExitCode>) -> ExitCode {
@@ -245,32 +339,9 @@ fn base_url(host: &str) -> String {
     }
 }
 
-/// Pull `--minify` from a positional-arg slice. Returns `(minify,
-/// remaining_args)`. Accepts the flag at any position because
-/// `script upload [name] <file.js>` is variadic and users naturally
-/// append it. A `--` sentinel ends flag parsing so a literal value of
-/// `--minify` (e.g. `run <host> -e -- --minify`) survives.
-fn take_minify_flag(args: &[String]) -> (bool, Vec<String>) {
-    let mut minify = false;
-    let mut rest = Vec::with_capacity(args.len());
-    let mut end_of_options = false;
-    for arg in args {
-        if end_of_options {
-            rest.push(arg.clone());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => end_of_options = true,
-            "--minify" => minify = true,
-            _ => rest.push(arg.clone()),
-        }
-    }
-    (minify, rest)
-}
-
-fn read_source(path: &str) -> Result<String, ExitCode> {
+fn read_source(path: &Path) -> Result<String, ExitCode> {
     std::fs::read_to_string(path).map_err(|e| {
-        eprintln!("error: reading {path}: {e}");
+        eprintln!("error: reading {}: {e}", path.display());
         ExitCode::FAILURE
     })
 }
@@ -293,47 +364,24 @@ fn maybe_minify(source: String, enabled: bool, source_name: &str) -> Result<Stri
 /// upload handles that.)
 const SCRIPT_SIZE_BUDGET: usize = 65_535;
 
-fn run_compile(args: &[String]) -> ExitCode {
-    let usage = "usage: shellyctl compile <input.js> [-o output.js]";
-
-    let (input, out_path): (&str, Option<&str>) = match args {
-        [input] if !input.starts_with('-') => (input.as_str(), None),
-        [input, flag, path] if !input.starts_with('-') && flag == "-o" => {
-            (input.as_str(), Some(path.as_str()))
-        }
-        [_, flag] if flag == "-o" => {
-            eprintln!("error: -o requires an output path");
-            eprintln!("{usage}");
-            return ExitCode::from(2);
-        }
-        [first, ..] if first.starts_with('-') => {
-            eprintln!("error: unexpected flag '{first}' (input file must come first)");
-            eprintln!("{usage}");
-            return ExitCode::from(2);
-        }
-        _ => {
-            eprintln!("{usage}");
-            return ExitCode::from(2);
-        }
-    };
-
+fn run_compile(input: &Path, out_path: Option<&Path>) -> ExitCode {
     let source = match read_source(input) {
         Ok(s) => s,
         Err(c) => return c,
     };
     let source_len = source.len();
-    let minified = match maybe_minify(source, true, input) {
+    let input_name = input.display().to_string();
+    let minified = match maybe_minify(source, true, &input_name) {
         Ok(m) => m,
         Err(c) => return c,
     };
-    let ratio = if source_len == 0 {
-        "n/a".to_string()
-    } else {
-        format!("{}%", minified.len() * 100 / source_len)
+    let ratio = match (minified.len() * 100).checked_div(source_len) {
+        Some(pct) => format!("{pct}%"),
+        None => "n/a".to_string(),
     };
     eprintln!(
         "{}: {} -> {} bytes ({})",
-        input,
+        input_name,
         source_len,
         minified.len(),
         ratio,
@@ -343,11 +391,11 @@ fn run_compile(args: &[String]) -> ExitCode {
     match out_path {
         Some(path) => match std::fs::write(path, &minified) {
             Ok(()) => {
-                eprintln!("Wrote {path}");
+                eprintln!("Wrote {}", path.display());
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("error writing {path}: {e}");
+                eprintln!("error writing {}: {e}", path.display());
                 ExitCode::FAILURE
             }
         },
@@ -498,7 +546,7 @@ async fn run_update(host: &str) -> ExitCode {
     }
 }
 
-async fn run_record(host: &str, out_dir: &str) -> ExitCode {
+async fn run_record(host: &str, out_dir: &Path) -> ExitCode {
     let stack = StdStack;
     let base = base_url(host);
     let mut device = match Device::new(&stack, &stack, &base) {
@@ -518,7 +566,7 @@ async fn run_record(host: &str, out_dir: &str) -> ExitCode {
         }
     };
 
-    let dir = std::path::Path::new(out_dir).join(&app);
+    let dir = out_dir.join(&app);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("error creating {}: {e}", dir.display());
         return ExitCode::FAILURE;
@@ -629,20 +677,9 @@ async fn run_call(host: &str, method: &str) -> ExitCode {
     }
 }
 
-fn run_discover(args: &[String]) -> ExitCode {
+fn run_discover(timeout_secs: u64) -> ExitCode {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
     use std::time::{Duration, Instant};
-
-    let timeout_secs: u64 = match args.first() {
-        Some(s) => match s.parse::<u64>() {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("error: invalid timeout '{s}': {e}");
-                return ExitCode::from(2);
-            }
-        },
-        None => 5,
-    };
 
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
@@ -993,9 +1030,9 @@ impl ChunkDecoder {
     }
 }
 
-async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
+async fn run_script(host: String, action: ScriptCmd) -> ExitCode {
     let stack = StdStack;
-    let base = base_url(host);
+    let base = base_url(&host);
     let mut device = match Device::new(&stack, &stack, &base) {
         Ok(d) => d,
         Err(e) => {
@@ -1006,7 +1043,7 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
     let mut buf = [0u8; 4096];
 
     match action {
-        "list" => match device.script_list(&mut buf).await {
+        ScriptCmd::List => match device.script_list(&mut buf).await {
             Ok(list) => {
                 for s in &list.scripts {
                     let name = s.name.unwrap_or("(unnamed)");
@@ -1021,24 +1058,26 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        "upload" => {
-            let (do_minify, args) = take_minify_flag(args);
-            let (name, file_path) = match args.len() {
-                1 => {
-                    let p = &args[0];
-                    let Some(n) = std::path::Path::new(p).file_stem().and_then(|s| s.to_str())
-                    else {
+        ScriptCmd::Upload {
+            minify,
+            name_or_file,
+            file,
+        } => {
+            // If FILE is omitted, treat name_or_file as the file path and
+            // derive the script name from its stem. Matches the previous
+            // single-arg fallback (`upload foo.js` → name "foo").
+            let (name, file_path): (String, PathBuf) = match file {
+                Some(path) => (name_or_file, path),
+                None => {
+                    let path = PathBuf::from(&name_or_file);
+                    let Some(n) = path.file_stem().and_then(|s| s.to_str()) else {
                         eprintln!(
-                            "error: cannot derive script name from '{p}' (non-UTF-8); pass an explicit name"
+                            "error: cannot derive script name from '{}' (non-UTF-8); pass an explicit name",
+                            path.display()
                         );
                         return ExitCode::FAILURE;
                     };
-                    (n.to_string(), p.clone())
-                }
-                2 => (args[0].clone(), args[1].clone()),
-                _ => {
-                    eprintln!("usage: shellyctl script <host> upload [--minify] [name] <file.js>");
-                    return ExitCode::from(2);
+                    (n.to_string(), path)
                 }
             };
 
@@ -1047,11 +1086,12 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
                 Err(c) => return c,
             };
             let source_len = source.len();
-            let code = match maybe_minify(source, do_minify, &file_path) {
+            let source_name = file_path.display().to_string();
+            let code = match maybe_minify(source, minify, &source_name) {
                 Ok(c) => c,
                 Err(c) => return c,
             };
-            if do_minify {
+            if minify {
                 eprintln!("Minified {} -> {} bytes", source_len, code.len());
                 warn_if_oversize(code.len());
             }
@@ -1086,150 +1126,42 @@ async fn run_script(host: &str, action: &str, args: &[String]) -> ExitCode {
 
             ExitCode::SUCCESS
         }
-        "start" => {
-            let Some(id) = args.first().and_then(|s| s.parse::<u32>().ok()) else {
-                eprintln!("usage: shellyctl script <host> start <id>");
-                return ExitCode::from(2);
-            };
-            match device.script_start(id, &mut buf).await {
-                Ok(r) => {
-                    eprintln!(
-                        "Started script #{id} (was {})",
-                        if r.was_running { "running" } else { "stopped" }
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+        ScriptCmd::Start { id } => match device.script_start(id, &mut buf).await {
+            Ok(r) => {
+                eprintln!(
+                    "Started script #{id} (was {})",
+                    if r.was_running { "running" } else { "stopped" }
+                );
+                ExitCode::SUCCESS
             }
-        }
-        "stop" => {
-            let Some(id) = args.first().and_then(|s| s.parse::<u32>().ok()) else {
-                eprintln!("usage: shellyctl script <host> stop <id>");
-                return ExitCode::from(2);
-            };
-            match device.script_stop(id, &mut buf).await {
-                Ok(r) => {
-                    eprintln!(
-                        "Stopped script #{id} (was {})",
-                        if r.was_running { "running" } else { "stopped" }
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
             }
-        }
-        "delete" => {
-            let Some(id) = args.first().and_then(|s| s.parse::<u32>().ok()) else {
-                eprintln!("usage: shellyctl script <host> delete <id>");
-                return ExitCode::from(2);
-            };
-            match device.script_delete(id, &mut buf).await {
-                Ok(_) => {
-                    eprintln!("Deleted script #{id}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+        },
+        ScriptCmd::Stop { id } => match device.script_stop(id, &mut buf).await {
+            Ok(r) => {
+                eprintln!(
+                    "Stopped script #{id} (was {})",
+                    if r.was_running { "running" } else { "stopped" }
+                );
+                ExitCode::SUCCESS
             }
-        }
-        other => {
-            eprintln!("error: unknown script action `{other}`");
-            eprintln!("actions: list, upload, start, stop, delete");
-            ExitCode::from(2)
-        }
-    }
-}
-
-fn usage() -> ExitCode {
-    eprintln!(
-        "shelly {version}\n\
-         \n\
-         USAGE:\n    \
-             shelly <command> [args]\n\
-         \n\
-         COMMANDS:\n    \
-             discover [secs]                     Discover devices via mDNS\n    \
-             status   <host>                     Fetch and display device status\n    \
-             update   <host>                     Install available firmware update\n    \
-             script   <host> list                List scripts\n    \
-             script   <host> upload [--minify] [name] <js>  Create + upload a script (use --minify to compile first)\n    \
-             script   <host> start <id>          Start a script\n    \
-             script   <host> stop  <id>          Stop a script\n    \
-             script   <host> delete <id>         Delete a script\n    \
-             compile  <in.js> [-o out.js]        Minify a script (stdout if no -o)\n    \
-             run      <host> [--minify] <file.js>   Run a script ephemerally (use --minify to compile first)\n    \
-             run      <host> [--minify] -e 'code'   Run inline JS ephemerally\n    \
-             logs     <host>                     Stream device debug log\n    \
-             record   <host> <dir>               Record RPC responses\n    \
-             call     <host> <method>            Call a raw RPC method\n    \
-             cloud    login                      Auth key from Shelly Cloud\n    \
-             cloud    login-diy                  OAuth login (WIP, limited)\n    \
-             cloud    scene list                  List cloud scenes\n    \
-             cloud    scene run <id>              Trigger a cloud scene\n    \
-             cloud    scene add <name> <text>     Create notification scene\n    \
-             cloud    scene delete <id>           Delete a scene\n    \
-             cloud    init <host> <ws> <wd> <ds> <dd>  Provision scene IDs on device\n    \
-             self-update                         Update shellyctl to the latest release\n    \
-             help                                Show this message",
-        version = env!("SHELLYCTL_VERSION"),
-    );
-    ExitCode::from(2)
-}
-
-#[cfg(test)]
-mod take_minify_flag_tests {
-    use super::take_minify_flag;
-
-    fn strings(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn accepts_flag_at_end() {
-        let args = strings(&["script.js", "--minify"]);
-        let (minify, rest) = take_minify_flag(&args);
-        assert!(minify);
-        assert_eq!(rest, strings(&["script.js"]));
-    }
-
-    #[test]
-    fn accepts_flag_in_middle_and_preserves_order() {
-        let args = strings(&["name", "--minify", "upload.js"]);
-        let (minify, rest) = take_minify_flag(&args);
-        assert!(minify);
-        assert_eq!(rest, strings(&["name", "upload.js"]));
-    }
-
-    #[test]
-    fn removes_multiple_occurrences() {
-        let args = strings(&["--minify", "script.js", "--minify"]);
-        let (minify, rest) = take_minify_flag(&args);
-        assert!(minify);
-        assert_eq!(rest, strings(&["script.js"]));
-    }
-
-    #[test]
-    fn returns_original_args_when_flag_missing() {
-        let args = strings(&["name", "upload.js"]);
-        let (minify, rest) = take_minify_flag(&args);
-        assert!(!minify);
-        assert_eq!(rest, strings(&["name", "upload.js"]));
-    }
-
-    #[test]
-    fn double_dash_sentinel_preserves_literal_minify() {
-        let args = strings(&["-e", "--", "--minify"]);
-        let (minify, rest) = take_minify_flag(&args);
-        assert!(!minify);
-        assert_eq!(rest, strings(&["-e", "--minify"]));
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        ScriptCmd::Delete { id } => match device.script_delete(id, &mut buf).await {
+            Ok(_) => {
+                eprintln!("Deleted script #{id}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -1357,5 +1289,102 @@ mod pick_chunk_len_tests {
         // A non-empty string should always return a positive length;
         // the caller upload_code_chunked relies on forward progress.
         assert!(pick_chunk_len("x", 1) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod cli_parse_tests {
+    //! Pin load-bearing clap attributes so attribute drift fails the build
+    //! instead of breaking the CLI surface for users.
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("shellyctl").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn cloud_init_orders_four_u64_scene_ids() {
+        let cli = parse(&["cloud", "init", "192.168.1.10", "10", "20", "30", "40"]).unwrap();
+        match cli.command {
+            Cmd::Cloud {
+                action:
+                    CloudCmd::Init {
+                        host,
+                        washer_start,
+                        washer_done,
+                        dryer_start,
+                        dryer_done,
+                    },
+            } => {
+                assert_eq!(host, "192.168.1.10");
+                assert_eq!(
+                    (washer_start, washer_done, dryer_start, dryer_done),
+                    (10, 20, 30, 40)
+                );
+            }
+            _ => panic!("expected Cloud::Init"),
+        }
+    }
+
+    #[test]
+    fn cloud_init_rejects_negative_id() {
+        assert!(parse(&["cloud", "init", "host", "-1", "2", "3", "4"]).is_err());
+    }
+
+    #[test]
+    fn discover_defaults_to_five_seconds() {
+        let cli = parse(&["discover"]).unwrap();
+        match cli.command {
+            Cmd::Discover { timeout_secs } => assert_eq!(timeout_secs, 5),
+            _ => panic!("expected Discover"),
+        }
+    }
+
+    #[test]
+    fn discover_rejects_non_numeric_timeout() {
+        assert!(parse(&["discover", "abc"]).is_err());
+    }
+
+    #[test]
+    fn run_rejects_when_neither_eval_nor_file_given() {
+        assert!(parse(&["run", "host"]).is_err());
+    }
+
+    #[test]
+    fn run_rejects_when_both_eval_and_file_given() {
+        assert!(parse(&["run", "host", "-e", "x", "foo.js"]).is_err());
+    }
+
+    #[test]
+    fn run_accepts_eval_only() {
+        assert!(parse(&["run", "host", "-e", "print(1)"]).is_ok());
+    }
+
+    #[test]
+    fn run_accepts_file_only() {
+        assert!(parse(&["run", "host", "foo.js"]).is_ok());
+    }
+
+    #[test]
+    fn script_upload_minify_flag_before_positional() {
+        assert!(parse(&["script", "host", "upload", "--minify", "foo.js"]).is_ok());
+    }
+
+    #[test]
+    fn script_upload_minify_flag_after_positionals() {
+        assert!(parse(&["script", "host", "upload", "name", "foo.js", "--minify"]).is_ok());
+    }
+
+    #[test]
+    fn cloud_scene_add_requires_both_args() {
+        assert!(parse(&["cloud", "scene", "add", "name"]).is_err());
+        assert!(parse(&["cloud", "scene", "add", "name", "text"]).is_ok());
+    }
+
+    #[test]
+    fn completions_rejects_unknown_shell() {
+        assert!(parse(&["completions", "garbage"]).is_err());
+        assert!(parse(&["completions", "bash"]).is_ok());
     }
 }
