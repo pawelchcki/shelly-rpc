@@ -173,43 +173,35 @@ pub fn scene_run(id: &str) -> ExitCode {
     }
 }
 
+/// Cloud scene IDs to provision into a device's KVS for laundry-cycle
+/// notifications. Pass 0 in any field to disable that notification.
+pub struct KvsSceneIds {
+    pub washer_start: u64,
+    pub washer_done: u64,
+    pub dryer_start: u64,
+    pub dryer_done: u64,
+}
+
 /// Build the JSON body for `KVS.Set` that provisions the `cloud` key on a
 /// device. The value is a JSON object serialized as a JSON string (double
 /// encoding): inner-string fields are JSON-escaped once when built into
 /// `inner`, and `inner` is JSON-escaped again when embedded as the string
 /// value of the outer `value` field.
-fn build_kvs_body(server: &str, key: &str, ids: &[u64; 4]) -> String {
+fn build_kvs_body(server: &str, key: &str, ids: &KvsSceneIds) -> String {
     let inner = format!(
         r#"{{"u":"{}","k":"{}","ws":{},"wd":{},"ds":{},"dd":{}}}"#,
         json_escape(server),
         json_escape(key),
-        ids[0],
-        ids[1],
-        ids[2],
-        ids[3],
+        ids.washer_start,
+        ids.washer_done,
+        ids.dryer_start,
+        ids.dryer_done,
     );
     format!(r#"{{"key":"cloud","value":"{}"}}"#, json_escape(&inner))
 }
 
 /// Provision cloud notification config to device KVS.
-///
-/// Scene IDs map to KVS keys: ws (washer-start), wd (washer-done),
-/// ds (dryer-start), dd (dryer-done). Pass 0 to disable a notification.
-pub fn init_device(host: &str, scenes: &[String]) -> ExitCode {
-    if scenes.len() != 4 {
-        eprintln!("usage: shellyctl cloud init <host> <washer-start> <washer-done> <dryer-start> <dryer-done>");
-        return ExitCode::from(2);
-    }
-    let mut ids = [0u64; 4];
-    for (i, s) in scenes.iter().enumerate() {
-        match s.parse::<u64>() {
-            Ok(n) => ids[i] = n,
-            Err(e) => {
-                eprintln!("error: scene #{} ('{s}') is not a valid ID: {e}", i + 1);
-                return ExitCode::from(2);
-            }
-        }
-    }
+pub fn init_device(host: &str, ids: &KvsSceneIds) -> ExitCode {
     let CloudConfig {
         server,
         auth_key: key,
@@ -221,7 +213,7 @@ pub fn init_device(host: &str, scenes: &[String]) -> ExitCode {
         }
     };
 
-    let body = build_kvs_body(&server, &key, &ids);
+    let body = build_kvs_body(&server, &key, ids);
 
     let url = format!("http://{host}/rpc/KVS.Set");
     match ureq::post(&url)
@@ -239,8 +231,14 @@ pub fn init_device(host: &str, scenes: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             eprintln!("Provisioned cloud config on {host}");
-            eprintln!("  washer: start=#{} done=#{}", scenes[0], scenes[1]);
-            eprintln!("  dryer:  start=#{} done=#{}", scenes[2], scenes[3]);
+            eprintln!(
+                "  washer: start=#{} done=#{}",
+                ids.washer_start, ids.washer_done
+            );
+            eprintln!(
+                "  dryer:  start=#{} done=#{}",
+                ids.dryer_start, ids.dryer_done
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -460,7 +458,12 @@ mod tests {
         let body = build_kvs_body(
             "https://shelly-96-eu.shelly.cloud",
             "abc123",
-            &[10, 20, 30, 40],
+            &KvsSceneIds {
+                washer_start: 10,
+                washer_done: 20,
+                dryer_start: 30,
+                dryer_done: 40,
+            },
         );
         let outer: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(outer["key"], "cloud");
@@ -477,7 +480,16 @@ mod tests {
     #[test]
     fn build_kvs_body_escapes_quotes_and_backslashes_in_key() {
         let key = "ke\\\"y\\\n";
-        let body = build_kvs_body("https://ex.com", key, &[0, 0, 0, 0]);
+        let body = build_kvs_body(
+            "https://ex.com",
+            key,
+            &KvsSceneIds {
+                washer_start: 0,
+                washer_done: 0,
+                dryer_start: 0,
+                dryer_done: 0,
+            },
+        );
         let outer: serde_json::Value = serde_json::from_str(&body).unwrap();
         let value_str = outer["value"].as_str().unwrap();
         let inner: serde_json::Value = serde_json::from_str(value_str).unwrap();
@@ -486,7 +498,16 @@ mod tests {
 
     #[test]
     fn build_kvs_body_handles_u64_max() {
-        let body = build_kvs_body("https://ex.com", "k", &[u64::MAX, 0, 0, 0]);
+        let body = build_kvs_body(
+            "https://ex.com",
+            "k",
+            &KvsSceneIds {
+                washer_start: u64::MAX,
+                washer_done: 0,
+                dryer_start: 0,
+                dryer_done: 0,
+            },
+        );
         let outer: serde_json::Value = serde_json::from_str(&body).unwrap();
         let value_str = outer["value"].as_str().unwrap();
         let inner: serde_json::Value = serde_json::from_str(value_str).unwrap();
