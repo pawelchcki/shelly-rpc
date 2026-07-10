@@ -203,8 +203,12 @@ function postEvent(title, text, tags, alertType) {
     content_type: "application/json",
     timeout: 15,
   }, function (res, err) {
-    if (err) return;
-    if (!res || typeof res.code !== "number") return;
+    // callRpc logs the transport err already.
+    if (err) { log("!event transport"); return; }
+    if (!res || typeof res.code !== "number") {
+      log("!event no-response");
+      return;
+    }
     if (res.code >= 300) log("event " + res.code);
   });
 }
@@ -373,7 +377,7 @@ function seedSwitches(done) {
 callRpc("KVS.Get", { key: "dd_cfg" }, function (res) {
   if (res) {
     try { mergeInto(DD_CFG, JSON.parse(res.value)); }
-    catch (e) { log("!dd_cfg parse"); }
+    catch (e) { log("!dd_cfg parse err=" + e); }
   }
   Shelly.addStatusHandler(onStatus);
   Shelly.addEventHandler(onEvent);

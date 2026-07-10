@@ -71,15 +71,27 @@ function currentUnixTime() {
   return Shelly.getComponentStatus("sys").unixtime;
 }
 
+// True while a KVS.Set is in flight or pending retry. A persist failure
+// would leave the next reboot resurrecting stale state (since reset to
+// "now") and either re-firing or missing a notification, so we keep
+// retrying on the next tick until KVS accepts the write.
+let persistPending = false;
+
 function persistState() {
+  if (persistPending) return;
+  persistPending = true;
   Shelly.call("KVS.Set", {
     key:   "mon",
     value: JSON.stringify({ w: washerState, d: dryerState }),
   }, function (res, err, errMsg) {
+    persistPending = false;
     if (err) {
-      // Invisible KVS failure would leave the state machine thinking
-      // it persisted when it didn't — surface it in the device log.
-      print("!mon save err=" + err + " " + (errMsg || ""));
+      print("!mon save err=" + err + " " + (errMsg || "") +
+            " — retrying next tick");
+      // Schedule a retry on the next tick by leaving persistPending=false;
+      // tick() calls persistState again whenever state changes, but the
+      // caller may not change state for a while, so re-arm explicitly.
+      Timer.set(POLL_INTERVAL_MS, false, persistState);
     }
   });
 }
@@ -91,9 +103,28 @@ function triggerCloudScene(sceneId) {
   }
   let url = cloud.u + "/scene/manual_run?auth_key=" + cloud.k +
             "&id=" + sceneId;
-  Shelly.call("HTTP.GET", { url: url }, function (response, errorCode) {
+  // HTTP.GET returns errorCode === 0 whenever the TCP request succeeded —
+  // the HTTP status (and Cloud's "isok:false" error envelope) lives in the
+  // response. Inspect both so a 401/404/429/5xx or rejected scene id doesn't
+  // silently drop the user's notification.
+  Shelly.call("HTTP.GET", { url: url }, function (response, errorCode, errorMsg) {
     if (errorCode) {
-      print("!scene " + errorCode);
+      print("!scene transport=" + errorCode + " " + (errorMsg || ""));
+      return;
+    }
+    if (!response || typeof response.code !== "number") {
+      print("!scene no-response id=" + sceneId);
+      return;
+    }
+    if (response.code < 200 || response.code >= 300) {
+      let body = response.body || "";
+      print("!scene http=" + response.code + " id=" + sceneId +
+            " body=" + body.slice(0, 80));
+      return;
+    }
+    if (response.body && response.body.indexOf("\"isok\":false") >= 0) {
+      print("!scene isok=false id=" + sceneId +
+            " body=" + response.body.slice(0, 80));
     }
   });
 }
@@ -199,7 +230,7 @@ Shelly.call("KVS.Get", { key: "cloud" }, function (cloudResult) {
     try {
       cloud = JSON.parse(cloudResult.value);
     } catch (e) {
-      print("!cloud");
+      print("!cloud parse err=" + e);
     }
   }
 
@@ -219,7 +250,7 @@ Shelly.call("KVS.Get", { key: "cloud" }, function (cloudResult) {
         }
         print("rs w:" + washerState.s + " d:" + dryerState.s);
       } catch (e) {
-        print("!mon");
+        print("!mon parse err=" + e);
       }
     }
     print("mon sw" + WASHER_SWITCH_ID + " sw" + DRYER_SWITCH_ID);

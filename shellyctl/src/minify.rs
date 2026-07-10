@@ -55,7 +55,8 @@ fn join_parse_errors(
 
 #[derive(Debug)]
 pub enum MinifyError {
-    /// User-supplied source failed to parse as ES5.
+    /// User-supplied source failed to parse as JavaScript. The parser
+    /// accepts modern ES syntax — only the transform pipeline targets ES5.
     Parse(String),
     /// SWC codegen failed to write its emitter buffer.
     Codegen(String),
