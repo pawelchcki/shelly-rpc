@@ -206,7 +206,7 @@ let CFG = {
 
 let STATS = {
   cycles: [],
-  ema_effective_rate: 0.30, // seeded, clamped into [0.5x, 2x] at runtime
+  ema_effective_rate: 0.30, // seeded; clamped to [0.05, 2.0] g/m^3/min in adaptiveMinEffRate()
   ema_peak_rh:        85.0,
   last_flush_ts:      0,    // unixtime of the most recent KVS.Set
 };
@@ -217,11 +217,22 @@ let indoor  = { rh: null, t: null, ah: null, ts: 0 };
 let outdoor = { rh: null, t: null, ah: null, ts: 0 };
 
 let baselineFast = null;  // EMA of AH, tau = baseline_fast_tau
-let baselineSlow = null;  // EMA of AH, tau = baseline_slow_tau (frozen not IDLE)
+let baselineSlow = null;  // EMA of AH, tau = baseline_slow_tau (frozen while mode != IDLE)
 let lastAH       = null;
 let lastAHts     = 0;
 
-let fanOn = false;
+// Relay actuation tracks intent (fanDesired) separately from the last
+// confirmed RPC ack (fanConfirmed). On Switch.Set failure, we re-issue the
+// call from a retry timer instead of relying on the state machine's next
+// tick — branches like "stop on futility / floor / max_run_s" transition
+// straight to COOLDOWN and never call setFan again, so a swallowed error
+// would leave the fan stuck on. After fan_relay_fault_streak consecutive
+// failures we emit `fan.relay_fault` so telemetry can alarm.
+let fanDesired      = false;
+let fanConfirmed    = false;
+let fanCallInFlight = false;
+let fanRetryArmed   = false;
+let fanFailureStreak = 0;
 
 let mode       = "IDLE";
 let modeSince  = 0;
@@ -290,18 +301,49 @@ function call(method, params, cb) {
 // ---------- Fan actuator ----------------------------------------------------
 
 function setFan(on) {
-  if (on === fanOn) return;
-  fanOn = on;
-  log("fan " + (on ? "ON" : "OFF"));
+  // Coalesce only when desired AND confirmed already match the request —
+  // if a prior call's RPC failed (desired set, confirmed lagging), we
+  // must let the retry path keep firing.
+  if (on === fanDesired && on === fanConfirmed) return;
+  if (on !== fanDesired) {
+    log("fan " + (on ? "ON" : "OFF"));
+    fanDesired = on;
+  }
+  if (fanCallInFlight) return;
+  issueFanRpc();
+}
+
+function issueFanRpc() {
+  fanCallInFlight = true;
+  let target = fanDesired;
   // Route through the logging callback — a failed relay command is the
   // single highest-consequence failure in this controller (state
   // machine believes it switched but didn't), so we don't want it
   // silent. `call()` already logs `!Switch.Set err=...` on failure.
-  call("Switch.Set", { id: CFG.switch_id, on: on }, function (res, err) {
+  call("Switch.Set", { id: CFG.switch_id, on: target }, function (res, err) {
+    fanCallInFlight = false;
     if (err) {
-      // Roll back our in-memory belief so the next tick tries again.
-      fanOn = !on;
+      fanFailureStreak = fanFailureStreak + 1;
+      if (fanFailureStreak === 3) {
+        Shelly.emitEvent("fan.relay_fault", {
+          desired:   fanDesired,
+          confirmed: fanConfirmed,
+          streak:    fanFailureStreak,
+        });
+      }
+      if (!fanRetryArmed) {
+        fanRetryArmed = true;
+        Timer.set(2000, false, function () {
+          fanRetryArmed = false;
+          if (fanDesired !== fanConfirmed) issueFanRpc();
+        });
+      }
+      return;
     }
+    fanConfirmed = target;
+    fanFailureStreak = 0;
+    // Desired may have flipped while the RPC was in flight; reconcile.
+    if (fanDesired !== fanConfirmed) issueFanRpc();
   });
 }
 
@@ -395,25 +437,30 @@ function recordCycle(endAH, endReason) {
 // stats_save_interval_s (default 24 h). The first write after boot
 // bootstraps the entry and subsequent writes happen on a rolling daily
 // cadence. In-memory stats remain up-to-date regardless.
+let flushInProgress = false;
+
 function maybeFlushStats() {
   let now = nowTs();
   if (STATS.last_flush_ts !== 0 &&
       (now - STATS.last_flush_ts) < CFG.stats_save_interval_s) {
     return;
   }
+  // Gate concurrent flushes — a second cycle ending mid-write would race
+  // the in-flight KVS.Set against the ~5 concurrent-call cap, and its
+  // failure callback could clobber the in-flight write's success.
+  if (flushInProgress) return;
+  flushInProgress = true;
   // Serialize before the call so the payload reflects the current
   // EMAs; bump last_flush_ts only on successful persist so a failed
   // write doesn't start a fresh 24 h coalescing window.
-  STATS.last_flush_ts = now;
   let payload = JSON.stringify(STATS);
   call("KVS.Set", {
     key:   "fan_stats",
     value: payload,
   }, function (res, err) {
-    if (err) {
-      STATS.last_flush_ts = 0;  // retry next cycle
-      return;
-    }
+    flushInProgress = false;
+    if (err) return;
+    STATS.last_flush_ts = now;
     log("flushed fan_stats");
   });
 }
@@ -688,7 +735,11 @@ function onStatusEvent(ev) {
 // and crashed with "Cannot read property 'current' of undefined".
 function parseOpenMeteo(body) {
   let parsed = null;
-  try { parsed = JSON.parse(body); } catch (e) { return null; }
+  try { parsed = JSON.parse(body); }
+  catch (e) {
+    log("!weather parse err=" + e + " body=" + body.slice(0, 80));
+    return null;
+  }
   if (parsed === null) return null;
   let c = parsed.current;
   if (c === null || typeof c !== "object") return null;
@@ -748,7 +799,7 @@ function loadCfg(done) {
         let loaded = JSON.parse(res.value);
         mergeInto(CFG, loaded);
       } catch (e) {
-        log("!fan_cfg parse");
+        log("!fan_cfg parse err=" + e);
       }
     }
     done();
@@ -762,7 +813,7 @@ function loadStats(done) {
         let loaded = JSON.parse(res.value);
         mergeInto(STATS, loaded);
       } catch (e) {
-        log("!fan_stats parse");
+        log("!fan_stats parse err=" + e);
       }
     }
     done();
@@ -797,8 +848,11 @@ function startNormalOps(weatherOk) {
 
 function start() {
   // Make sure the fan is off at boot — we don't inherit prior state
-  // because the state machine restarts from IDLE.
-  setFan(false);
+  // because the state machine restarts from IDLE. setFan(false) would
+  // short-circuit (desired == confirmed == false at init), so issue the
+  // RPC unconditionally to align the relay with our IDLE belief in case
+  // it was left ON across a script restart.
+  issueFanRpc();
   // Probe outdoor weather. The controller itself stays oblivious to
   // its observers — we just emit a boot event (see startNormalOps)
   // and whatever is listening can react.

@@ -269,7 +269,11 @@ function onEvent(ev) {
 
 function parseOpenMeteo(body) {
   let p = null;
-  try { p = JSON.parse(body); } catch (e) { return null; }
+  try { p = JSON.parse(body); }
+  catch (e) {
+    log("!weather parse err=" + e + " body=" + body.slice(0, 80));
+    return null;
+  }
   if (p === null) return null;
   let c = p.current;
   if (c === null || typeof c !== "object") return null;
@@ -285,10 +289,18 @@ function pollWeather() {
             "&longitude=" + DD_CFG.lon +
             "&current=temperature_2m,relative_humidity_2m";
   callRpc("HTTP.GET", { url: url, timeout: 15 }, function (res, err) {
+    // callRpc already logs the transport-level err.
     if (err) return;
-    if (!res || res.code !== 200 || !res.body) return;
+    if (!res || typeof res.code !== "number") {
+      log("!weather no-response");
+      return;
+    }
+    if (res.code !== 200 || !res.body) {
+      log("!weather http=" + res.code);
+      return;
+    }
     let cur = parseOpenMeteo(res.body);
-    if (cur === null) { log("!weather parse"); return; }
+    if (cur === null) { log("!weather fields"); return; }
     outdoor.rh = cur.rh;
     outdoor.t  = cur.t;
     outdoor.ah = ah(cur.rh, cur.t);
@@ -346,8 +358,13 @@ function postEvent(title, text, tags, alertType) {
     content_type: "application/json",
     timeout: 15,
   }, function (res, err) {
-    if (err) return;
-    if (!res || typeof res.code !== "number") return;
+    // callRpc already logs the transport-level err; event posts shouldn't
+    // disappear silently when the device or Datadog returns nothing.
+    if (err) { log("!event transport"); return; }
+    if (!res || typeof res.code !== "number") {
+      log("!event no-response");
+      return;
+    }
     if (res.code >= 300) {
       log("event " + res.code + " " + (res.body || "").slice(0, 80));
     }
@@ -462,7 +479,8 @@ function collectAndPost() {
                 let lrn = [];
                 if (r) {
                   let stats = null;
-                  try { stats = JSON.parse(r.value); } catch (e) { stats = null; }
+                  try { stats = JSON.parse(r.value); }
+                  catch (e) { log("!fan_stats parse err=" + e); stats = null; }
                   if (stats) {
                     pushMetric(lrn, ts, "shelly.fan.ema_effective_rate", stats.ema_effective_rate);
                     pushMetric(lrn, ts, "shelly.fan.ema_peak_rh",        stats.ema_peak_rh);
@@ -553,7 +571,7 @@ function seedLiveState() {
 callRpc("KVS.Get", { key: "dd_cfg" }, function (res) {
   if (res) {
     try { mergeInto(DD_CFG, JSON.parse(res.value)); }
-    catch (e) { log("!dd_cfg parse"); }
+    catch (e) { log("!dd_cfg parse err=" + e); }
   }
   Shelly.addStatusHandler(onStatus);
   Shelly.addEventHandler(onEvent);
