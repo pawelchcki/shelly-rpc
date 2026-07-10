@@ -19,6 +19,7 @@ use crate::nal::StdStack;
 #[command(
     name = "shellyctl",
     version = env!("SHELLYCTL_VERSION"),
+    propagate_version = true,
     about = "Command-line client for Shelly Gen2+ smart devices",
     arg_required_else_help = true,
     disable_help_subcommand = true,
@@ -219,6 +220,17 @@ fn pick_chunk_len(s: &str, max: usize) -> usize {
 }
 
 fn main() -> ExitCode {
+    // Shipped binaries use `panic = "abort"` + `strip = "symbols"`, which
+    // means a panic exits without flushing line-buffered stdout. Wrap the
+    // default hook so the panic message and any buffered stdout reach the
+    // user before abort runs.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        use std::io::Write;
+        let _ = std::io::stdout().lock().flush();
+        let _ = std::io::stderr().lock().flush();
+    }));
     let cli = Cli::parse();
     match cli.command {
         Cmd::Discover { timeout_secs } => run_discover(timeout_secs),
@@ -1072,7 +1084,7 @@ async fn run_script(host: String, action: ScriptCmd) -> ExitCode {
                     let path = PathBuf::from(&name_or_file);
                     let Some(n) = path.file_stem().and_then(|s| s.to_str()) else {
                         eprintln!(
-                            "error: cannot derive script name from '{}' (non-UTF-8); pass an explicit name",
+                            "error: cannot derive script name from '{}' (no file stem); pass an explicit name",
                             path.display()
                         );
                         return ExitCode::FAILURE;
@@ -1386,5 +1398,13 @@ mod cli_parse_tests {
     fn completions_rejects_unknown_shell() {
         assert!(parse(&["completions", "garbage"]).is_err());
         assert!(parse(&["completions", "bash"]).is_ok());
+    }
+
+    #[test]
+    fn version_flag_propagates_to_subcommands() {
+        let Err(err) = parse(&["status", "--version"]) else {
+            panic!("expected --version to short-circuit the subcommand");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 }
